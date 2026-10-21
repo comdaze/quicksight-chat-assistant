@@ -1,0 +1,69 @@
+[
+  {
+    "name": "describe_dataset",
+    "description": "Columns and types of one dataset of the current analysis, and whether the built-in query can read it. Call it before query_dataset when you do not know the column names.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_id": {"type": "string", "description": "Dataset id from describe_analysis (datasets)."},
+        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."}
+      },
+      "required": ["dataset_id"]
+    }
+  },
+  {
+    "name": "query_dataset",
+    "description": "Read-only aggregate query on a dataset of the current analysis. You describe the query; the system builds the SQL. Returns rows plus a result_id that plot_result can draw. To answer for what the user currently sees, add filters for the current control values (see the parameter-driven filters in the analysis summary).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_id": {"type": "string", "description": "Dataset id from describe_analysis."},
+        "metrics": {
+          "type": "array",
+          "description": "1-10 aggregates.",
+          "items": {"type": "object", "properties": {
+            "column": {"type": "string", "description": "Column name; may be omitted for count."},
+            "agg": {"type": "string", "description": "sum, avg, min, max, count or count_distinct."}
+          }, "required": ["agg"]}
+        },
+        "dimensions": {"type": "array", "items": {"type": "string"}, "description": "0-3 columns to group by."},
+        "time": {"type": "object", "description": "Optional time bucket.", "properties": {
+          "column": {"type": "string"},
+          "grain": {"type": "string", "description": "hour, day, week, month, quarter or year."}
+        }},
+        "filters": {
+          "type": "array",
+          "description": "0-12 conditions, all must hold.",
+          "items": {"type": "object", "properties": {
+            "column": {"type": "string"},
+            "op": {"type": "string", "description": "eq, ne, in, not_in, gt, gte, lt, lte, between, contains, is_null, not_null."},
+            "value": {"type": "string", "description": "The value for eq, ne, gt, gte, lt, lte, contains. Dates as YYYY-MM-DD."},
+            "values": {"type": "array", "items": {"type": "string"}, "description": "The list for in / not_in, or [low, high] for between."}
+          }, "required": ["column", "op"]}
+        },
+        "order_by": {"type": "array", "description": "Output column names to sort by.", "items": {"type": "object", "properties": {
+          "name": {"type": "string"}, "desc": {"type": "boolean"}}}},
+        "limit": {"type": "integer", "description": "1-500 rows, default 200."},
+        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."}
+      },
+      "required": ["dataset_id", "metrics"]
+    }
+  },
+  {
+    "name": "distinct_values",
+    "description": "Up to 50 distinct values of a dataset column (most frequent first), optionally containing a search text. Use it to find the exact value a user means before filtering or suggesting a control value.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_id": {"type": "string"},
+        "column": {"type": "string"},
+        "search": {"type": "string", "description": "Optional text the value must contain."},
+        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."}
+      },
+      "required": ["dataset_id", "column"]
+    }
+  }
+]

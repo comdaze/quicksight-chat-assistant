@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""qsca - build, deploy and operate the QuickSight chat assistant.
+
+  ./qsca build                         build Lambda and Runtime packages (Linux arm64 wheels) into build/
+  ./qsca deploy                        build, then `cdk deploy` the stack described by config.json
+  ./qsca outputs                       show the stack outputs
+  ./qsca idp-metadata FILE             store the Identity Center application metadata XML
+  ./qsca model                         set the OpenAI-compatible model (or edit the secret in the console)
+  ./qsca datasource-secret DATASOURCE  store database credentials for a QuickSight data source
+  ./qsca attach ANALYSIS [--apply]     print (or add to the analysis) the chat visual for an analysis
+  ./qsca check [--analysis ID]         check configuration: model, Identity Center, data source credentials
+  ./qsca smoke --analysis ID --email E ask one question end to end (needs the session key; admin only)
+
+Global options: --profile NAME (AWS CLI profile), --config PATH (default config.json).
+"""
+
+import argparse
+import base64
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+import zipfile
+
+ROOT = pathlib.Path(__file__).resolve().parent
+BUILD = ROOT / "build"
+PINS = {
+    "agent": ["strands-agents[openai]==1.61.1", "bedrock-agentcore==1.24.2", "boto3==1.43.115"],
+    "web": ["boto3==1.43.115", "signxml==5.2.0", "lxml==6.1.3", "cryptography==50.0.2"],
+    "tools-data": ["pg8000==1.31.5", "PyMySQL==1.1.2"],
+    "tools-analysis": [],
+}
+SOURCES = {
+    "agent": ["agent/main.py", "agent/charts.py", "agent/prompt.py"],
+    "web": ["web/handler.py", "web/auth.py", "web/index.html", "web/vendor/echarts-6.1.0.min.js"],
+    "tools-data": ["tools/data/handler.py", "tools/data/dataset.py", "tools/data/sqlcompile.py",
+                   "tools/common/caller.py", "tools/common/definition.py"],
+    "tools-analysis": ["tools/analysis/handler.py", "tools/common/caller.py", "tools/common/definition.py"],
+}
+RDS_CA = ["https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-north-1/cn-north-1-bundle.pem",
+          "https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-northwest-1/cn-northwest-1-bundle.pem"]
+CHAT_VISUAL_ID = "qsca-chat"
+
+
+def tls_context():
+    """python.org builds on macOS ship without a CA store; fall back to the bundle botocore trusts."""
+    import ssl
+    try:
+        from botocore.httpsession import get_cert_path
+        return ssl.create_default_context(cafile=get_cert_path(True))
+    except Exception:  # noqa: BLE001
+        return ssl.create_default_context()
+
+
+def die(message):
+    sys.exit(f"错误：{message}")
+
+
+def load_config(args):
+    path = pathlib.Path(args.config)
+    if not path.exists():
+        die(f"找不到 {path}。先复制 config.example.json 为 config.json 并按部署手册填写。")
+    return json.loads(path.read_text())
+
+
+def session(args, config):
+    import boto3
+    return boto3.Session(profile_name=args.profile, region_name=config["region"])
+
+
+def stack_name(config):
+    return f"{config['prefix']}-chat-assistant"
+
+
+def outputs(args, config):
+    stacks = session(args, config).client("cloudformation").describe_stacks(StackName=stack_name(config))["Stacks"]
+    return {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
+
+
+# ---------------------------------------------------------------- build
+def pip_install(target, requirements):
+    if not requirements:
+        return
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-compile", "--disable-pip-version-check",
+                    "--platform", "manylinux2014_aarch64", "--platform", "manylinux_2_28_aarch64",
+                    "--implementation", "cp", "--python-version", "3.12", "--only-binary=:all:",
+                    "--target", str(target), *requirements], check=True)
+
+
+def clean_tree(path):
+    for cache in list(path.rglob("__pycache__")):
+        shutil.rmtree(cache, ignore_errors=True)
+    for compiled in path.rglob("*.pyc"):
+        compiled.unlink()
+    shutil.rmtree(path / "bin", ignore_errors=True)
+
+
+def cmd_build(args):
+    BUILD.mkdir(exist_ok=True)
+    for name, requirements in PINS.items():
+        target = BUILD / name
+        stamp = hashlib.sha256(json.dumps(requirements).encode()).hexdigest()[:16]
+        current = (target / ".deps").read_text() if (target / ".deps").exists() else ""
+        if current != stamp:
+            print(f"==> {name}: installing {', '.join(requirements) or 'no extra packages'}")
+            shutil.rmtree(target, ignore_errors=True)
+            target.mkdir(parents=True)
+            pip_install(target, requirements)
+            (target / ".deps").write_text(stamp)
+        for source in SOURCES[name]:
+            destination = target / pathlib.Path(source).relative_to(source.split("/")[0]) if source.startswith("web/vendor") \
+                else target / pathlib.Path(source).name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / source, destination)
+        if name == "tools-data" and not (target / "rds-ca.pem").exists():
+            bundle = b"".join(urllib.request.urlopen(url, timeout=30, context=tls_context()).read() for url in RDS_CA)
+            (target / "rds-ca.pem").write_bytes(bundle)
+        clean_tree(target)
+        print(f"   build/{name}: {sum(f.stat().st_size for f in target.rglob('*') if f.is_file()) // 2**20} MB")
+    # AgentCore Runtime takes a ZIP from S3 and rejects packages that contain Python cache files.
+    archive = BUILD / "agent.zip"
+    archive.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for file in sorted((BUILD / "agent").rglob("*")):
+            if file.is_file() and file.name != ".deps":
+                zf.write(file, file.relative_to(BUILD / "agent"))
+    print(f"   build/agent.zip: {archive.stat().st_size // 2**20} MB")
+
+
+# ---------------------------------------------------------------- deploy
+def cmd_deploy(args):
+    config = load_config(args)
+    cmd_build(args)
+    env = {**os.environ, **({"AWS_PROFILE": args.profile} if args.profile else {}), "AWS_REGION": config["region"]}
+    infra = ROOT / "infra"
+    if not (infra / "node_modules").exists():
+        subprocess.run(["npm", "ci", "--no-audit", "--no-fund"], cwd=infra, check=True, env=env)
+    command = ["npx", "cdk", "deploy", "--context", f"config={pathlib.Path(args.config).resolve()}",
+               "--require-approval", "never" if args.yes else "broadening", "--outputs-file", str(BUILD / "outputs.json")]
+    subprocess.run(command, cwd=infra, check=True, env=env)
+    print("\n部署完成。下一步见 docs/部署手册.md 第 4 节（Identity Center、模型、数据源凭证、接入分析）。")
+    cmd_outputs(args)
+
+
+def cmd_outputs(args):
+    for key, value in sorted(outputs(args, load_config(args)).items()):
+        print(f"{key:24} {value}")
+
+
+# ---------------------------------------------------------------- post-deployment configuration
+def cmd_idp_metadata(args):
+    config = load_config(args)
+    xml = pathlib.Path(args.file).read_text(encoding="utf-8")
+    if "IDPSSODescriptor" not in xml:
+        die("这不是 Identity Center 应用的 SAML 元数据文件（缺少 IDPSSODescriptor）")
+    name = outputs(args, config)["IdpMetadataParameter"]
+    session(args, config).client("ssm").put_parameter(
+        Name=name, Value=xml, Type="String", Overwrite=True, Tier="Advanced" if len(xml) > 4000 else "Standard")
+    print(f"已写入 {name}（{len(xml)} 字节）。约 5 分钟内生效，无需重新部署。")
+
+
+def cmd_model(args):
+    config = load_config(args)
+    name = outputs(args, config)["ModelSecretName"]
+    base_url = args.base_url or input("模型 base_url（OpenAI 兼容，如 https://host/v1）：").strip()
+    model = args.model or input("模型名称：").strip()
+    api_key = getpass.getpass("API Key（输入不回显）：").strip()
+    if not base_url.startswith("https://"):
+        print("提醒：base_url 不是 https，模型请求和 API Key 将以明文传输。")
+    value = {"base_url": base_url, "model": model, "api_key": api_key, "temperature": args.temperature, "timeout": 120}
+    session(args, config).client("secretsmanager").put_secret_value(SecretId=name, SecretString=json.dumps(value))
+    print(f"已更新 {name}。Runtime 最迟 60 秒后使用新模型。")
+
+
+def cmd_datasource_secret(args):
+    config = load_config(args)
+    prefix = config["dataAccess"]["datasourceSecretPrefix"]
+    sm = session(args, config).client("secretsmanager")
+    username = input(f"数据源 {args.datasource} 的只读数据库用户名：").strip()
+    password = getpass.getpass("密码（输入不回显）：")
+    name, value = prefix + args.datasource, json.dumps({"username": username, "password": password})
+    try:
+        sm.create_secret(Name=name, SecretString=value, Description=f"QuickSight data source {args.datasource} (read-only)")
+        print(f"已创建 {name}")
+    except sm.exceptions.ResourceExistsException:
+        sm.put_secret_value(SecretId=name, SecretString=value)
+        print(f"已更新 {name}")
+
+
+# ---------------------------------------------------------------- attach
+def chat_url(base, analysis_id, parameter_names, viewer):
+    parts = [f"analysis={analysis_id}"]
+    if viewer:
+        parts.append(f"viewer=<<${viewer}>>")
+    parts += [f"p.{name}=<<${name}>>" for name in parameter_names if name != viewer]
+    return base.rstrip("/") + "/?" + "&".join(parts)
+
+
+def cmd_attach(args):
+    config = load_config(args)
+    qs = session(args, config).client("quicksight")
+    account = session(args, config).client("sts").get_caller_identity()["Account"]
+    out = qs.describe_analysis_definition(AwsAccountId=account, AnalysisId=args.analysis)
+    definition, name = out["Definition"], out["Name"]
+    names = [next(iter(p.values()))["Name"] for p in definition.get("ParameterDeclarations", [])]
+    viewer = args.viewer_parameter if args.viewer_parameter in names else None
+    url = chat_url(outputs(args, config)["ChatUrl"], args.analysis, names, viewer)
+    print(f"分析：{name}（{args.analysis}），参数：{', '.join(names) or '无'}")
+    print(f"\n聊天窗口地址（自定义可视内容 / Custom visual content 的 URL）：\n{url}\n")
+    if len(url) > 2048:
+        print("提醒：地址超过 2048 个字符，可能被 QuickSight 截断；请减少参数或用 --only 指定参数。")
+    if not args.apply:
+        print("未修改分析。加 --apply 可以把聊天窗口直接加到分析里（会先在 build/ 备份定义）。")
+        return
+    if not definition.get("DataSetIdentifierDeclarations"):
+        die("分析没有数据集，无法添加自定义可视内容")
+    backup = BUILD / f"attach-backup-{args.analysis}-{int(time.time())}.json"
+    BUILD.mkdir(exist_ok=True)
+    backup.write_text(json.dumps({"Name": name, "Definition": definition}, ensure_ascii=False, default=str))
+    sheets = definition.get("Sheets", [])
+    sheet = next((s for s in sheets if s["SheetId"] == args.sheet), None) if args.sheet else (sheets[0] if sheets else None)
+    if sheet is None:
+        die(f"找不到工作表 {args.sheet}")
+    visual = {"CustomContentVisual": {
+        "VisualId": CHAT_VISUAL_ID, "DataSetIdentifier": definition["DataSetIdentifierDeclarations"][0]["Identifier"],
+        "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": "分析助手"}},
+        "ChartConfiguration": {"ContentUrl": url, "ContentType": "OTHER_EMBEDDED_CONTENT"}}}
+    if args.replace:  # take over an existing visual's place in the layout (e.g. an older chat embed)
+        old = [v for v in sheet.setdefault("Visuals", []) if next(iter(v.values())).get("VisualId") == args.replace]
+        if not old:
+            die(f"工作表里没有图表 {args.replace}")
+        sheet["Visuals"].remove(old[0])
+        for layout in sheet.get("Layouts", []):
+            for kind in ("GridLayout", "FreeFormLayout", "SectionBasedLayout"):
+                for element in (layout.get("Configuration", {}).get(kind) or {}).get("Elements", []):
+                    if element.get("ElementId") == args.replace:
+                        element["ElementId"] = CHAT_VISUAL_ID
+        for group in definition.get("FilterGroups", []):  # drop scoping references to the removed visual
+            for item in group.get("ScopeConfiguration", {}).get("SelectedSheets", {}).get("SheetVisualScopingConfigurations", []):
+                if args.replace in item.get("VisualIds", []):
+                    item["VisualIds"] = [CHAT_VISUAL_ID if v == args.replace else v for v in item["VisualIds"]]
+        sheet["Visuals"].append(visual)
+        print(f"已用聊天窗口替换图表 {args.replace}（保留其布局位置）。")
+    existing = [v for v in sheet.setdefault("Visuals", []) if next(iter(v.values())).get("VisualId") == CHAT_VISUAL_ID]
+    if args.replace:
+        pass  # already placed above
+    elif existing:
+        sheet["Visuals"][sheet["Visuals"].index(existing[0])] = visual
+        print("已存在聊天窗口，更新其地址。")
+    else:
+        sheet["Visuals"].append(visual)
+        layout = ((sheet.get("Layouts") or [{}])[0].get("Configuration") or {})
+        if "GridLayout" in layout:
+            layout["GridLayout"].setdefault("Elements", []).append(
+                {"ElementId": CHAT_VISUAL_ID, "ElementType": "VISUAL", "ColumnSpan": 12, "RowSpan": 20})
+        elif "FreeFormLayout" in layout:
+            layout["FreeFormLayout"].setdefault("Elements", []).append(
+                {"ElementId": CHAT_VISUAL_ID, "ElementType": "VISUAL", "XAxisLocation": "0px", "YAxisLocation": "0px",
+                 "Width": "600px", "Height": "700px"})
+    qs.update_analysis(AwsAccountId=account, AnalysisId=args.analysis, Name=name, Definition=definition)
+    for _ in range(60):
+        info = qs.describe_analysis(AwsAccountId=account, AnalysisId=args.analysis)["Analysis"]
+        if not info["Status"].endswith("_IN_PROGRESS"):
+            break
+        time.sleep(2)
+    if info.get("Errors") or not info["Status"].endswith("SUCCESSFUL"):
+        die(f"更新分析失败：{info['Status']} {info.get('Errors')}；原定义已备份在 {backup}")
+    print(f"已加到工作表“{sheet.get('Name')}”。刷新分析页面即可看到；仪表盘需重新发布。备份：{backup}")
+
+
+# ---------------------------------------------------------------- check / smoke
+def cmd_check(args):
+    config = load_config(args)
+    s = session(args, config)
+    out = outputs(args, config)
+    ok = True
+
+    def report(good, message):
+        nonlocal ok
+        ok &= good
+        print(f"{'✓' if good else '✗'} {message}")
+
+    model = json.loads(s.client("secretsmanager").get_secret_value(SecretId=out["ModelSecretName"])["SecretString"])
+    report("<" not in json.dumps(model), f"模型已配置（{out['ModelSecretName']}）" if "<" not in json.dumps(model)
+           else f"模型未配置：编辑 Secrets Manager 中的 {out['ModelSecretName']}，或运行 ./qsca model")
+    if "<" not in json.dumps(model) and not str(model.get("base_url", "")).startswith("https://"):
+        print("  提醒：模型 base_url 不是 https")
+    try:
+        s.client("ssm").get_parameter(Name=out["IdpMetadataParameter"])
+        report(True, "Identity Center 元数据已上传")
+    except Exception:  # noqa: BLE001
+        report(False, "Identity Center 元数据未上传：./qsca idp-metadata <下载的元数据 XML>")
+    if args.analysis:
+        qs = s.client("quicksight")
+        account = s.client("sts").get_caller_identity()["Account"]
+        definition = qs.describe_analysis_definition(AwsAccountId=account, AnalysisId=args.analysis)["Definition"]
+        visual = [v for sh in definition.get("Sheets", []) for v in sh.get("Visuals", [])
+                  if next(iter(v.values())).get("VisualId") == CHAT_VISUAL_ID]
+        report(bool(visual), "分析里已有聊天窗口" if visual else "分析里没有聊天窗口：./qsca attach <分析ID> --apply")
+        prefix = config["dataAccess"]["datasourceSecretPrefix"]
+        for declaration in definition.get("DataSetIdentifierDeclarations", []):
+            dataset = qs.describe_data_set(AwsAccountId=account, DataSetId=declaration["DataSetArn"].rsplit("/", 1)[-1])["DataSet"]
+            for table in dataset.get("PhysicalTableMap", {}).values():
+                body = next(iter(table.values()))
+                source_id = body.get("DataSourceArn", "").rsplit("/", 1)[-1]
+                if not source_id:
+                    continue
+                try:
+                    s.client("secretsmanager").describe_secret(SecretId=prefix + source_id)
+                    report(True, f"数据集 {dataset['Name']} → 数据源 {source_id}：凭证已配置")
+                except Exception:  # noqa: BLE001
+                    report(False, f"数据集 {dataset['Name']} → 数据源 {source_id}：缺少凭证 {prefix}{source_id}"
+                                  f"（./qsca datasource-secret {source_id}）")
+    sys.exit(0 if ok else 1)
+
+
+def mint_token(s, secret_name, email, seconds=900):
+    raw = s.client("secretsmanager").get_secret_value(SecretId=secret_name)["SecretString"]
+    key = hashlib.sha256(raw.encode()).digest()
+    b64u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()  # noqa: E731
+    now = int(time.time())
+    body = b64u(json.dumps({"sub": email.lower(), "name": email, "iat": now, "exp": now + seconds, "jti": uuid.uuid4().hex},
+                           separators=(",", ":")).encode())
+    return body + "." + b64u(hmac.new(key, body.encode(), hashlib.sha256).digest())
+
+
+def http(method, url, token, body=None):
+    request = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=60, context=tls_context()) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read() or b"{}")
+
+
+def cmd_smoke(args):
+    config = load_config(args)
+    s = session(args, config)
+    out = outputs(args, config)
+    token = mint_token(s, out["SessionSecretName"], args.email)
+    base = out["ChatUrl"].rstrip("/")
+    status, job = http("POST", f"{base}/chat", token, {"prompt": args.prompt, "analysis": args.analysis,
+                                                        "parameters": dict(p.split("=", 1) for p in args.param),
+                                                        "sessionId": f"qs-smoke-{uuid.uuid4().hex}"})
+    if status != 202:
+        die(f"提交失败 HTTP {status}: {job}")
+    print(f"job {job['jobId']} 已提交")
+    for _ in range(200):
+        time.sleep(3)
+        status, result = http("GET", f"{base}/jobs/{job['jobId']}", token)
+        if result.get("status") != "RUNNING":
+            break
+    print(json.dumps({k: result.get(k) for k in ("status", "error", "answer", "steps", "totalMs")}, ensure_ascii=False, indent=1))
+    for chart in result.get("charts") or []:
+        print(f"chart: {chart['type']} {chart['title']} points={len(chart['x'])} series={[s['name'] for s in chart['series']]}"
+              f"{' pending_change=' + chart['pending_change']['id'] if chart.get('pending_change') else ''}")
+    if result.get("controls"):
+        print("controls:", result["controls"])
+    sys.exit(0 if result.get("status") == "SUCCEEDED" else 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="qsca", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE"))
+    parser.add_argument("--config", default=str(ROOT / "config.json"))
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("build").set_defaults(func=cmd_build)
+    deploy = sub.add_parser("deploy")
+    deploy.add_argument("--yes", action="store_true", help="do not ask to approve IAM changes")
+    deploy.set_defaults(func=cmd_deploy)
+    sub.add_parser("outputs").set_defaults(func=cmd_outputs)
+    idp = sub.add_parser("idp-metadata")
+    idp.add_argument("file")
+    idp.set_defaults(func=cmd_idp_metadata)
+    model = sub.add_parser("model")
+    model.add_argument("--base-url")
+    model.add_argument("--model")
+    model.add_argument("--temperature", type=float, default=0.2)
+    model.set_defaults(func=cmd_model)
+    secret = sub.add_parser("datasource-secret")
+    secret.add_argument("datasource", help="QuickSight data source id")
+    secret.set_defaults(func=cmd_datasource_secret)
+    attach = sub.add_parser("attach")
+    attach.add_argument("analysis")
+    attach.add_argument("--apply", action="store_true", help="add the chat visual to the analysis")
+    attach.add_argument("--sheet", help="sheet id (default: first sheet)")
+    attach.add_argument("--replace", help="visual id to replace with the chat (keeps its place in the layout)")
+    attach.add_argument("--viewer-parameter", default="pViewer", help="parameter holding the viewer email (optional)")
+    attach.set_defaults(func=cmd_attach)
+    check = sub.add_parser("check")
+    check.add_argument("--analysis")
+    check.set_defaults(func=cmd_check)
+    smoke = sub.add_parser("smoke")
+    smoke.add_argument("--analysis", required=True)
+    smoke.add_argument("--email", required=True)
+    smoke.add_argument("--prompt", default="这个分析有哪些图表？用三句话说明。")
+    smoke.add_argument("--param", action="append", default=[], help="name=value control value, repeatable")
+    smoke.set_defaults(func=cmd_smoke)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

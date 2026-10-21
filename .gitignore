@@ -1,0 +1,9 @@
+# local configuration and generated files
+config.json
+build/
+infra/node_modules/
+infra/cdk.out/
+infra/cdk.context.json
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,44 @@
+[
+  {
+    "name": "describe_analysis",
+    "description": "Structure of the QuickSight analysis the chat panel is embedded in: sheets, visuals (visual_id, type, title, the fields each one plots), parameters with their control titles and default values, which dataset columns each parameter filters, and the dataset ids. The summary is usually already in your instructions; call this only when you need it refreshed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_parameters": {"type": "object", "description": "Filled in by the system. Never set it."}
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "preview_visual_change",
+    "description": "Prepare (do not apply) switching one visual of the analysis between line chart and bar chart. The chat page shows a preview with an apply button; only the user's button press changes the analysis. Only users who can edit the analysis in QuickSight are allowed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "visual_id": {"type": "string", "description": "visual_id from describe_analysis."},
+        "chart_type": {"type": "string", "description": "bar (柱状图) or line (折线图)."},
+        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_parameters": {"type": "object", "description": "Filled in by the system. Never set it."}
+      },
+      "required": ["visual_id", "chart_type"]
+    }
+  },
+  {
+    "name": "undo_last_visual_change",
+    "description": "Undo the most recent applied chart-type change of this analysis by restoring the definition saved before it. Refuses when the analysis was edited again afterwards, unless force is true (only when the user explicitly asks, e.g. 强制撤销).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "force": {"type": "boolean", "description": "Overwrite later edits too. Only when the user explicitly says so."},
+        "_caller": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_analysis": {"type": "string", "description": "Filled in by the system. Never set it."},
+        "_parameters": {"type": "object", "description": "Filled in by the system. Never set it."}
+      },
+      "required": []
+    }
+  }
+]

@@ -1,0 +1,31 @@
+{
+  "prefix": "qsca",
+  "region": "cn-north-1",
+  "quickSight": {
+    "namespace": "default",
+    "allowedAnalysisIds": ["*"]
+  },
+  "identityCenter": {
+    "samlEntityId": "urn:quicksight-chat-assistant:chat"
+  },
+  "dataAccess": {
+    "vpc": {
+      "vpcId": "vpc-0123456789abcdef0",
+      "subnetIds": ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"],
+      "securityGroupIds": [],
+      "createInterfaceEndpoints": true
+    },
+    "datasourceSecretPrefix": "quicksight-chat-assistant/datasource/",
+    "extraSecretArns": []
+  },
+  "mcpTargets": [],
+  "runtime": {
+    "idleSeconds": 300,
+    "maxLifetimeSeconds": 28800
+  },
+  "api": {
+    "rateLimit": 5,
+    "burstLimit": 10
+  },
+  "frameAncestors": "https://*.quicksight.amazonaws.cn https://*.amazonaws.cn"
+}
