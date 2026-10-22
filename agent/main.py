@@ -88,6 +88,18 @@ class ConfigError(Exception):
     pass
 
 
+MODEL_RETRIES = 3  # retries of a model call that failed mid-stream, with a 5xx or a connection error
+
+
+def _transient(error):
+    """True for model errors worth retrying: 5xx, timeouts, network, and errors sent inside an open stream.
+    Throttling is retried by Strands itself (ModelThrottledException), so it is left alone here."""
+    import openai  # noqa: PLC0415 - imported lazily with the model client
+    if isinstance(error, openai.APIStatusError):
+        return error.status_code in (408, 409) or error.status_code >= 500
+    return isinstance(error, openai.APIError)
+
+
 def llm_config():
     with _config_lock:
         if _config["value"] and time.time() - _config["at"] < CONFIG_TTL:
@@ -420,6 +432,17 @@ def run_agent(payload, cancel_signal=None):
     def after_model(event: AfterModelCallEvent):
         ms = int((time.time() - timing["mark"]) * 1000)
         timing["model_ms"].append(ms)
+        if event.exception is not None and _transient(event.exception) and timing.get("retries", 0) < MODEL_RETRIES \
+                and not (cancel_signal and cancel_signal.is_set()):
+            # Errors inside an already-open stream (HTTP 200, then an error event) are not covered by the client's
+            # max_retries, which only retries before the response starts. Retry the model call here.
+            timing["retries"] = timing.get("retries", 0) + 1
+            log(event="model_retry", attempt=timing["retries"], ms=ms, error=repr(event.exception)[:200])
+            time.sleep(min(2 ** timing["retries"], 8))
+            event.retry = True
+            return
+        if event.exception is None:
+            timing["retries"] = 0
         stop = event.stop_response.stop_reason if event.stop_response else None
         if stop not in ("end_turn", "tool_use"):  # unusual end (max_tokens, error): keep a short excerpt for diagnosis
             parts = (event.stop_response.message.get("content", []) if event.stop_response else [])
