@@ -86,7 +86,8 @@ def handler(event, _context):
         return {"dashboard": dashboard_id, "changed": False}
     qs.update_dashboard_published_version(AwsAccountId=ACCOUNT, DashboardId=dashboard_id, VersionNumber=number)
     if analysis_id:
-        qs.tag_resource(ResourceArn=info["Arn"], Tags=[{"Key": SOURCE_TAG, "Value": analysis_id}])
+        arn = info["Arn"].split("/version/")[0]  # describe_dashboard with a version number returns a version ARN
+        qs.tag_resource(ResourceArn=arn, Tags=[{"Key": SOURCE_TAG, "Value": analysis_id}])
     log(event="dashboard_marked", dashboard=dashboard_id, analysis=analysis_id, from_version=version["VersionNumber"],
         version=number)
     return {"dashboard": dashboard_id, "changed": True, "version": number}

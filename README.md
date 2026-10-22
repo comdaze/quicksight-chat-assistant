@@ -296,6 +296,7 @@ the largest fixed cost)**, CloudWatch Logs, plus your model. Use the AWS pricing
 | Query timeout / connection error | Database security group or routing does not allow the data tools Lambda |
 | Chat says it is not bound to an analysis | Embed URL lacks `analysis=`: run `attach --apply` again |
 | Applied but nothing changed | Refresh the page; republish the dashboard |
+| Visuals show "出现错误" right after a publish or an applied change | The page still uses the replaced version; refresh (sometimes a few times) |
 
 Logs: `/aws/lambda/<prefix>-web`, `/aws/lambda/<prefix>-analysis-tools`, `/aws/lambda/<prefix>-data-tools`, and
 `/aws/bedrock-agentcore/runtimes/<prefix>_agent-…-DEFAULT` (one stream per session; `model_streaming` events show a
@@ -392,5 +393,5 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 
 见英文部分 [Troubleshooting](#troubleshooting) 与 [Limitations](#limitations)。常见：登录弹窗提示未配置 → 上传元数据；
 回答“管理员尚未配置模型” → 编辑模型密钥；“缺少数据库凭证” → 创建数据源密钥；“内置查询不支持这个数据集” → 数据集有 RLS、过滤或联接，
-可接入企业 MCP；应用后看不到变化 → 刷新页面、重新发布仪表盘；模型报 `401` → API Key 失效或过期；1 到 2 分钟后提示“输出过长被截断” → 模型输出失控，重试或换更稳定的模型；
+可接入企业 MCP；应用后看不到变化 → 刷新页面、重新发布仪表盘；发布或应用修改后图表短暂显示“出现错误” → 页面还在用旧版本，刷新（有时要多刷几次）；模型报 `401` → API Key 失效或过期；1 到 2 分钟后提示“输出过长被截断” → 模型输出失控，重试或换更稳定的模型；
 回答慢 → 看 Runtime 日志 `answered` 事件里每次的 `setup_ms`、`tool_ms`、`model_ms`；聊天窗口显示邮箱而不是姓名 → 看 web Lambda 日志 `name_lookup_failed`。
