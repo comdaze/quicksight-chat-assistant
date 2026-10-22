@@ -10,7 +10,8 @@ A chat panel for **any Amazon QuickSight analysis or dashboard**. Users stay in 
 language; the assistant queries the data behind the analysis using the current control values, calculates, draws
 charts, tells the user which control values to pick, and edits the analysis conversationally (with a preview the user
 must approve, and undo). Built on Amazon Bedrock **AgentCore Runtime, Gateway and Code Interpreter** with
-**Strands Agents**; the model is any **OpenAI-compatible endpoint** you provide. Verified in AWS China (Beijing,
+**Strands Agents**; the model is any **OpenAI-compatible endpoint** you provide (e.g. Amazon Bedrock, or a gateway
+such as LiteLLM), switchable at any time without redeploying. Verified in AWS China (Beijing,
 cn-north-1).
 
 ## Features
@@ -18,13 +19,14 @@ cn-north-1).
 | Capability | How it works |
 |---|---|
 | Ask about the data | Reads the analysis structure (sheets, visuals, parameters, parameter-driven filters, datasets, columns) and runs read-only aggregate queries on the datasets with the current control values |
-| Charts in the chat | Answers include ECharts line/bar charts; every number is read from tool results by code, never typed by the model |
+| Charts in the chat | Answers render as Markdown (headings, lists, tables) and include ECharts line/bar charts; every number in a chart is read from tool results by code, never typed by the model |
 | Calculations | `analyze_result` runs pandas on query results in an AgentCore Code Interpreter with **no network** (period-over-period, share, rank, moving average, correlation, outliers, joins) |
 | Control guidance | Lists the values to pick in the dashboard controls (QuickSight does not let an embedded iframe change controls) |
 | Conversational analysis editing | Change chart type (line / bar / table), title, measures and aggregation, category and date grain, color split, sort; add or delete visuals. Every edit is a **preview** first; only the user's **Apply** button changes the analysis; **undo** restores the saved definition |
 | Enterprise tools | Optional MCP servers (e.g. DataHub, Metabase via MCPHub) registered on the gateway |
 | Long and cancellable | Answers run as background jobs (HealthyBusy, up to the session lifetime); cancel stops within seconds |
-| Access control | Identity Center sign-in; users only see analyses / dashboards they can view in QuickSight and only edit analyses they can edit there |
+| Access control | Identity Center sign-in (the chat shows the user's name from the Identity Center directory); users only see analyses / dashboards they can view in QuickSight and only edit analyses they can edit there |
+| Example questions | A collapsed bar under the input box with one tab per capability; replaceable per deployment (`examples`) |
 
 ## Architecture
 
@@ -34,7 +36,9 @@ QuickSight analysis / dashboard
        │ HTTPS + session token (after IAM Identity Center SAML sign-in)
        ▼
 API Gateway HTTP API ─▶ Web Lambda ───────────────────────────▶ DynamoDB (jobs, sign-in state, pending edits)
-                         │ submit job (returns at once)                ▲ heartbeats / result
+                         │ │                                           ▲ heartbeats / result
+                         │ └─ sign-in: Identity Center identity store (read the user's name by email)
+                         │ submit job (returns at once)                │
                          ▼                                             │
                   AgentCore Runtime: Strands agent (one microVM per session)
                          │  ├─ local tools: plot_result, preview_analysis_change, suggest_controls
@@ -45,7 +49,7 @@ API Gateway HTTP API ─▶ Web Lambda ─────────────�
                     ├ analysis tools Lambda ─▶ QuickSight API (read / edit analysis, permissions), S3 (backups)
                     ├ data tools Lambda (VPC) ─▶ databases behind the datasets (parameterized read-only SQL)
                     └ enterprise MCP servers (optional)
-Model: your OpenAI-compatible endpoint (URL and key in Secrets Manager)
+Model: your OpenAI-compatible endpoint, e.g. Bedrock bedrock-runtime /openai/v1 (URL and key in Secrets Manager)
 ```
 
 Everything is one CDK stack in the QuickSight region. The `Apply` button calls the web Lambda, which invokes the
@@ -56,7 +60,7 @@ analysis tools Lambda directly as that user; the model can preview and undo edit
 | Path | Contents |
 |---|---|
 | `agent/` | Runtime agent (Strands): jobs, heartbeats, cancel, charts (`charts.py`), sandbox (`sandbox.py`), prompt |
-| `web/` | Web Lambda: chat page, SAML login, job API, apply endpoint; `web/vendor/` ECharts 6.1.0 (Apache-2.0) |
+| `web/` | Web Lambda: chat page, SAML login, job API, apply endpoint; `web/vendor/` ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17 (pinned copies with npm integrity, see `web/vendor/README.md`; no CDN) |
 | `tools/analysis/` | Gateway tools: describe the analysis, preview / apply / undo edits |
 | `tools/data/` | Gateway tools: describe datasets, structured aggregate queries, distinct values |
 | `tools/common/` | Shared: caller verification and QuickSight permission checks, definition parsing, edit operations |
@@ -72,7 +76,7 @@ analysis tools Lambda directly as that user; the model can preview and undo edit
 |---|---|
 | AWS | Account and the QuickSight region (cn-north-1 verified); admin-level deploy permissions |
 | QuickSight | Enterprise edition, users sign in through IAM Identity Center; QuickSight user emails match Identity Center emails |
-| Model | OpenAI-compatible Chat Completions endpoint with tool calling and streaming, preferably HTTPS |
+| Model | OpenAI-compatible Chat Completions endpoint with tool calling and streaming, reachable from the Runtime over public HTTPS (Amazon Bedrock, OpenAI-compatible providers, or a gateway such as LiteLLM for other APIs) |
 | Machine | macOS or Linux, Node.js 20+, Python 3.9+ with `pip` and `boto3`, access to npm and PyPI (mirrors work: `npm config set registry …`, `PIP_INDEX_URL`). No Docker needed |
 | CDK bootstrap | Once per account/region: `cd infra && npm ci && npx cdk bootstrap aws://<account>/<region>` |
 
@@ -88,6 +92,7 @@ cp config.example.json config.json
 | `region` | QuickSight region |
 | `quickSight.namespace` / `allowedAnalysisIds` | QuickSight namespace (usually `default`); analyses the chat may be attached to (`["*"]` = any, still per-user permissions) |
 | `identityCenter.samlEntityId` | SAML audience you choose, e.g. `urn:quicksight-chat-assistant:chat` |
+| `identityCenter.identityStoreId` / `region` | Optional: where to look up users' display names. Default: the Identity Center instance in the deployment region |
 | `dataAccess.vpc` | Subnets for the data tools Lambda when the databases are in a VPC (`null` if they are public). Reusing the subnets of the QuickSight VPC connection is the easiest choice |
 | `dataAccess.vpc.securityGroupIds` | Extra security groups for the Lambda (e.g. one the database already allows) |
 | `dataAccess.vpc.createInterfaceEndpoints` | `true` creates QuickSight and Secrets Manager interface endpoints (needed when the subnets have no NAT); `false` if the VPC already has them |
@@ -96,6 +101,7 @@ cp config.example.json config.json
 | `mcpTargets` | Enterprise MCP servers (see below); `[]` for none |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job) |
 | `api.rateLimit` / `burstLimit` | HTTP API throttling |
+| `frameAncestors` | Origins allowed to embed the chat page (the QuickSight console domains of your region) |
 | `examples` | Optional example questions for the chat page, replacing the built-in generic ones: `[{"group": "…", "tip": "…", "questions": ["…"]}]`, at most 2500 bytes as JSON. Use it to tailor a demo to your data |
 
 ### 2. Deploy
@@ -132,8 +138,11 @@ In Secrets Manager, edit `<prefix>/model-config` (output `ModelSecretName`) as p
 {"base_url": "https://your-endpoint/v1", "model": "model-name", "api_key": "your-key", "temperature": 0.2, "timeout": 120}
 ```
 
-Takes effect within 60 seconds; switching models is just editing this secret. Or run `./qsca --profile <p> model`.
-Optional `max_retries` (default 4) retries model calls that fail with 429, 5xx or a connection error.
+Takes effect within 60 seconds; switching models is just editing this secret (previous versions stay in Secrets
+Manager for rollback). Or run `./qsca --profile <p> model [--base-url … --model … --params '{…}' --timeout 180]`,
+which prompts for the key without echoing it. Leave out `temperature` for models that reject it.
+Optional `max_retries` (default 4) retries model calls that fail with 429, 5xx or a connection error; an error
+sent inside an already-open response stream is retried by the agent (up to 3 times).
 Optional `params` adds fields to every Chat Completions request (for example `{"reasoning_effort": "medium"}`).
 Questions and query results are sent to this endpoint: make sure it meets your data compliance rules and uses HTTPS.
 
@@ -153,6 +162,9 @@ that this is acceptable for the data. Notes from testing Kimi K3 (October 2026):
 - About 1 in 6 answers degenerated into garbled text regardless of effort or temperature, ending only at
   `max_tokens` (1-2 minutes, then a clear error). Keep `max_tokens` set. Occasional HTTP 500s, also inside an open
   stream, are retried automatically.
+- Long-term Bedrock API keys expire (a `401 Authentication failed` from the model means a new key is needed).
+
+After switching models, run `tests/e2e.py`: how well a model fills in tool arguments decides both speed and accuracy.
 
 ### 5. Database credentials (built-in data queries)
 
@@ -261,6 +273,10 @@ the largest fixed cost)**, CloudWatch Logs, plus your model. Use the AWS pricing
 | `audience mismatch` / `bearer confirmation does not match` | SAML audience or ACS URL differs from the stack outputs |
 | Error inside Identity Center after sign-in | User not assigned to the app, or `Subject` not mapped to `${user:email}` |
 | "管理员尚未配置模型" | Model secret still has the placeholder |
+| Model error `401 Authentication failed` | API key invalid or expired (Bedrock long-term keys expire): store a new one |
+| Answer fails after 1-2 minutes with "输出过长被截断" | The model produced runaway output and hit `max_tokens`; retry, or use a more stable model |
+| Answers are slow | Runtime log event `answered` has `setup_ms`, `tool_ms` and `model_ms` per call; repeated failed tool calls or slow model calls show there |
+| The chat shows the email, not the name | Log `name_lookup_failed` in the web Lambda: user not in the identity store, or Identity Center in another account / region (set `identityCenter.identityStoreId` / `region`) |
 | No permission for the analysis | The user cannot view it in QuickSight, or the emails differ |
 | Missing database credentials | Create the data source secret (step 5) |
 | Built-in query does not support a dataset | RLS, dataset filters, joins, or an unsupported source; add an enterprise MCP server |
@@ -269,7 +285,8 @@ the largest fixed cost)**, CloudWatch Logs, plus your model. Use the AWS pricing
 | Applied but nothing changed | Refresh the page; republish the dashboard |
 
 Logs: `/aws/lambda/<prefix>-web`, `/aws/lambda/<prefix>-analysis-tools`, `/aws/lambda/<prefix>-data-tools`, and
-`/aws/bedrock-agentcore/runtimes/<prefix>_agent-…-DEFAULT` (one stream per session).
+`/aws/bedrock-agentcore/runtimes/<prefix>_agent-…-DEFAULT` (one stream per session; `model_streaming` events show a
+model call that runs longer than 20 s, `model_retry` the automatic retries).
 
 ## Limitations
 
@@ -291,7 +308,7 @@ ACCOUNT_ID=0 SESSION_SECRET_ID=x QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-nort
 ```
 
 Pinned: strands-agents 1.61.1, bedrock-agentcore 1.24.2, boto3 1.43.115, signxml 5.2.0, lxml 6.1.3,
-cryptography 50.0.2, pg8000 1.31.5, PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 6.1.0.
+cryptography 50.0.2, pg8000 1.31.5, PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17.
 
 ---
 
@@ -301,7 +318,8 @@ cryptography 50.0.2, pg8000 1.31.5, PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 
 
 给 **任意 QuickSight 分析或仪表盘** 加一个聊天窗口。用户不离开 QuickSight，用中文提问；助手按当前控件查询分析背后的数据、
 做计算、在聊天里画图、提示要在控件里选什么值，还能用对话修改分析（先预览，用户点“应用”才生效，可撤销）。基于 Amazon
-Bedrock **AgentCore Runtime、Gateway、Code Interpreter** 与 **Strands Agents**，模型使用客户自己的 **OpenAI 兼容端点**。
+Bedrock **AgentCore Runtime、Gateway、Code Interpreter** 与 **Strands Agents**，模型使用客户自己的 **OpenAI 兼容端点**
+（如 Amazon Bedrock，或 LiteLLM 等网关），随时可换，无需重新部署。
 已在 AWS 中国区北京（cn-north-1）验证。
 
 ## 功能
@@ -309,13 +327,14 @@ Bedrock **AgentCore Runtime、Gateway、Code Interpreter** 与 **Strands Agents*
 | 能力 | 说明 |
 |---|---|
 | 数据问答 | 读取分析结构（工作表、图表、参数、参数驱动的筛选、数据集和列），按当前控件值对数据集做只读聚合查询 |
-| 聊天出图 | 回答附带 ECharts 折线图 / 柱状图；图里的数字由代码从工具结果读取，不由模型编写 |
+| 聊天出图 | 回答按 Markdown 显示（标题、列表、表格），附带 ECharts 折线图 / 柱状图；图里的数字由代码从工具结果读取，不由模型编写 |
 | 计算 | `analyze_result` 在 **无网络** 的 Code Interpreter 沙箱里用 pandas 处理查询结果（环比、同比、占比、排名、移动平均、相关性、异常值、合并结果） |
 | 控件提示 | 列出要在上方控件中选择的值（QuickSight 不允许嵌入的 iframe 修改控件） |
 | 对话式修改分析 | 改图表类型（折线 / 柱状 / 表格）、标题、指标与聚合、分类字段与时间粒度、颜色分组、排序，新增或删除图表。每次修改先 **预览**，用户点 **应用到分析** 才写入；可 **撤销** |
 | 企业工具 | 可选接入企业 MCP（如经 MCPHub 的 DataHub、Metabase） |
 | 长任务与取消 | 后台任务运行，最长到会话生命周期；取消通常几秒内生效 |
-| 权限 | Identity Center 登录；只能查看 QuickSight 中有权查看的分析/仪表盘，只能修改有编辑权限的分析 |
+| 权限 | Identity Center 登录（聊天窗口显示 Identity Center 目录中的姓名）；只能查看 QuickSight 中有权查看的分析/仪表盘，只能修改有编辑权限的分析 |
+| 示例问题 | 输入框下方的折叠栏，按能力分标签；每个部署可用 `examples` 替换 |
 
 ## 架构
 
@@ -325,11 +344,11 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 
 ## 部署
 
-1. **前提**：QuickSight 企业版且用 IAM Identity Center 登录（邮箱一致）；OpenAI 兼容模型端点；部署机器有 Node.js 20+、Python 3.9+（pip、boto3），能访问 npm 与 PyPI；目标账号区域执行过一次 `cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>`。
-2. **配置**：`cp config.example.json config.json`，按英文部分的配置表填写（前缀、区域、SAML 受众、数据工具 Lambda 的 VPC 子网、是否创建接口端点、数据源密钥前缀、企业 MCP；可选 `examples` 自定义聊天页的示例问题，便于针对客户数据演示）。数据库在 VPC 内时，推荐直接使用 QuickSight VPC 连接所在的子网。
+1. **前提**：QuickSight 企业版且用 IAM Identity Center 登录（邮箱一致）；OpenAI 兼容模型端点（支持工具调用和流式输出，Runtime 能经公网 HTTPS 访问，如 Amazon Bedrock、各家兼容接口，其他协议可经 LiteLLM 转换）；部署机器有 Node.js 20+、Python 3.9+（pip、boto3），能访问 npm 与 PyPI；目标账号区域执行过一次 `cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>`。
+2. **配置**：`cp config.example.json config.json`，按英文部分的配置表填写（前缀、区域、SAML 受众、可选的 Identity Store 位置、数据工具 Lambda 的 VPC 子网、是否创建接口端点、数据源密钥前缀、企业 MCP；允许嵌入聊天页的 `frameAncestors`；可选 `examples` 自定义聊天页的示例问题，便于针对客户数据演示）。数据库在 VPC 内时，推荐直接使用 QuickSight VPC 连接所在的子网。
 3. **部署**：`./qsca --profile <p> deploy`，完成后 `./qsca --profile <p> outputs` 查看 `ChatUrl`、`AcsUrl`、`SamlEntityId`、`ModelSecretName`。
 4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`（聊天窗口显示的姓名在登录时按邮箱从 Identity Center 用户目录读取，中文名按"姓+名"显示；断言里的 `familyName`、`givenName` 属性优先；Identity Center 在其他账号或区域时配置 `identityCenter.identityStoreId` / `region`，查不到就显示邮箱）；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
-5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效；或 `./qsca model`。可选 `max_retries`（默认 4）在模型返回 429、5xx 或连接失败时重试；可选 `params` 给每个请求附加字段（如 `{"reasoning_effort":"medium"}`）。使用 Amazon Bedrock 时 `base_url` 填 `https://bedrock-runtime.<区域>.amazonaws.com/openai/v1`、`api_key` 填 Bedrock API Key（Kimi K3 的模型 ID 如 `global.moonshotai.kimi-k3`（全球路由）或 `us.moonshotai.kimi-k3`（仅美国区域），建议 `params` 为 `{"reasoning_effort":"medium","max_tokens":8192}`；实测 `us.` 比 `global.` 快 2 到 5 倍，`low` 在修改分析类请求上会卡死；无论推理档位和温度，约六分之一的回答会变成乱码，直到 `max_tokens` 才结束，所以必须设 `max_tokens`；偶发的 500 会自动重试）；中国区没有 Bedrock，从中国区调用会跨境访问海外区域，需确认数据合规。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
+5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效，Secrets Manager 保留旧版本便于回退；或 `./qsca model`（可带 `--base-url`、`--model`、`--params`、`--timeout`，Key 输入不回显）。不接受 `temperature` 的模型去掉该字段。可选 `max_retries`（默认 4）在模型返回 429、5xx 或连接失败时重试，响应流中途的错误由 Agent 再重试最多 3 次；可选 `params` 给每个请求附加字段（如 `{"reasoning_effort":"medium"}`）。使用 Amazon Bedrock 时 `base_url` 填 `https://bedrock-runtime.<区域>.amazonaws.com/openai/v1`、`api_key` 填 Bedrock API Key（Kimi K3 的模型 ID 如 `global.moonshotai.kimi-k3`（全球路由）或 `us.moonshotai.kimi-k3`（仅美国区域），建议 `params` 为 `{"reasoning_effort":"medium","max_tokens":8192}`；实测 `us.` 比 `global.` 快 2 到 5 倍，`low` 在修改分析类请求上会卡死；无论推理档位和温度，约六分之一的回答会变成乱码，直到 `max_tokens` 才结束，所以必须设 `max_tokens`；偶发的 500 会自动重试；Bedrock 长期 API Key 会过期，模型报 `401 Authentication failed` 时换新 Key）。换模型后建议跑一遍 `tests/e2e.py`；中国区没有 Bedrock，从中国区调用会跨境访问海外区域，需确认数据合规。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
 6. **数据库凭证**：为分析用到的每个 QuickSight 数据源，在同一区域创建只读账号密钥 `<前缀><DataSourceId>`，内容 `{"username","password"}`（`./qsca datasource-secret <DataSourceId>`）；数据库安全组放行数据工具 Lambda。
 7. **接入分析**：`./qsca --profile <p> attach <分析ID> --apply`（只打印地址时去掉 `--apply`；`--replace <visual_id>` 可替换已有图表的位置），然后在 QuickSight 发布仪表盘。可选：建参数 `pViewer`（动态默认值为当前用户邮箱），用于检测同一浏览器切换了 QuickSight 用户。
 8. **自检**：`./qsca --profile <p> check --analysis <分析ID>`；管理员可用 `smoke` 和 `tests/e2e.py` 做端到端测试。
@@ -360,4 +379,5 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 
 见英文部分 [Troubleshooting](#troubleshooting) 与 [Limitations](#limitations)。常见：登录弹窗提示未配置 → 上传元数据；
 回答“管理员尚未配置模型” → 编辑模型密钥；“缺少数据库凭证” → 创建数据源密钥；“内置查询不支持这个数据集” → 数据集有 RLS、过滤或联接，
-可接入企业 MCP；应用后看不到变化 → 刷新页面、重新发布仪表盘。
+可接入企业 MCP；应用后看不到变化 → 刷新页面、重新发布仪表盘；模型报 `401` → API Key 失效或过期；1 到 2 分钟后提示“输出过长被截断” → 模型输出失控，重试或换更稳定的模型；
+回答慢 → 看 Runtime 日志 `answered` 事件里每次的 `setup_ms`、`tool_ms`、`model_ms`；聊天窗口显示邮箱而不是姓名 → 看 web Lambda 日志 `name_lookup_failed`。
