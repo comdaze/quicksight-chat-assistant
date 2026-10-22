@@ -250,7 +250,9 @@ These servers never receive the user's identity: expose read-only tools only.
    - *Sort descending by value* · *Rename it to …* · *Add a table of average price by station* · *Delete that chart*
    - Each request shows a **preview** (chart or table drawn with the edited visual's data) with **Apply** / **Discard**.
      After applying, **refresh the page** (the editor does not refresh by itself). Say **undo** to revert the latest
-     applied change (repeatable). Edits change the analysis only; republish the dashboard to update it. In a
+     applied change (repeatable). After **Apply**, **发布到仪表盘** (or typing "发布到仪表盘") publishes the analysis as
+     it is now to the dashboards published from it that the user may update, with the chat marked; the button stays
+     after a page refresh. Edits change the analysis only; republish the dashboard to update it. In a
      dashboard the chat offers no edits.
 4. **Cancel** stops a running answer; a page refresh (e.g. after picking a control value) resumes a running answer.
    The browser keeps 8 hours of conversation per user and analysis.
@@ -380,7 +382,7 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 3. 修改分析（需要该分析的编辑权限，在分析编辑界面里）：
    - “把价格走势改成柱状图”“改成按月显示”“改用电量的总和”“按场站分组”“按数值降序”“标题改成……”“新增一个按场站统计平均价格的表格”“删除这个图表”
    - 每次都会先出 **预览**（用修改后的口径画图或表格），点 **应用到分析** 才写入，点 **不用了** 放弃；预览 10 分钟内有效。
-   - 应用后需要 **手动刷新页面**；说 **撤销** 恢复最近一次已应用的修改，可连续撤销。只改分析，仪表盘需重新发布；仪表盘里的聊天窗口不提供修改。
+   - 应用后需要 **手动刷新页面**；说 **撤销** 恢复最近一次已应用的修改，可连续撤销。应用后可点 **发布到仪表盘**（或直接发送“发布到仪表盘”），把分析当前内容发布到由它发布、你有更新权限的仪表盘（自动带上仪表盘标记）；刷新页面后按钮仍在。只改分析，仪表盘需重新发布；仪表盘里的聊天窗口不提供修改。
 4. 等待时可点 **取消**；切换控件导致页面刷新后，会自动继续获取刚才的回答。本浏览器按用户和分析保存 8 小时内的对话。
 
 ## 安全

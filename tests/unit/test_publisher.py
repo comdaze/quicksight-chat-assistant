@@ -39,6 +39,12 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(publisher.mark(d), 1)
         self.assertEqual(urls(d)[0], CHAT + "&where=dashboard")
 
+    def test_explicit_chat_url(self):
+        # The 发布到仪表盘 button passes the chat page's own origin (the analysis tools have no CHAT_URL)
+        d = definition("https://other.example.com/?analysis=a1")
+        self.assertEqual(publisher.mark(d, "https://other.example.com"), 1)
+        self.assertTrue(urls(d)[0].endswith("&where=dashboard"))
+
     def test_ids_from_console_and_api_events(self):
         console = {"detail": {"requestParameters": None, "serviceEventDetails": {"eventRequestDetails": {
             "dashboardId": "arn:aws-cn:quicksight:cn-north-1:1:dashboard/d1",

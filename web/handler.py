@@ -10,6 +10,7 @@ Routes:
   GET  /jobs/{id}              job status, progress and result (STALLED when heartbeats stop)
   POST /jobs/{id}/cancel       cancel a running job
   POST /changes/{id}/apply     the 应用到分析 button: apply a previewed analysis change as this user
+  POST /dashboards/publish     the 发布到仪表盘 button: publish the analysis to its dashboards as this user
 """
 
 import base64
@@ -158,6 +159,19 @@ def submit(event, user):
     session_id = body.get("sessionId")
     if not isinstance(session_id, str) or not SESSION_ID.match(session_id):
         session_id = f"qs-{uuid.uuid4().hex}"
+    if publish_command(prompt):
+        started = time.time()
+        result = run_publish(event, user, analysis)
+        if "error" in result:
+            answer, ok = f"没有发布：{result['error']}", False
+        else:
+            names = "、".join(f"“{d['name']}”（第 {d['version']} 版）" for d in result.get("published", []))
+            answer, ok = f"已把分析的当前内容发布到仪表盘 {names}。打开仪表盘后刷新即可看到；刚发布时图表可能短暂报错，再刷新一次。", True
+        steps = [{"tool": "publish_dashboards", "arguments": {}, "ok": ok}]
+        job_id = answer_directly(user, answer, steps)
+        print(json.dumps({"job": job_id, "user": user["sub"], "event": "publish_command", "ok": ok,
+                          "ms": int((time.time() - started) * 1000)}))
+        return respond(202, {"jobId": job_id, "sessionId": session_id})
     # A Runtime session keeps the code version it started with and the browser reuses its id for hours, so bind the
     # session to user, analysis and Runtime version: a redeploy, user switch or another analysis starts fresh.
     runtime_session = "qs-" + hashlib.sha256(
@@ -255,6 +269,53 @@ def apply_change(change_id, event, user):
     return respond(409 if "error" in result else 200, result)
 
 
+def publish_dashboards(event, user):
+    """The 发布到仪表盘 button after an applied change; the analysis-tools Lambda checks the user's permissions."""
+    try:
+        body = request_json(event)
+    except ValueError:
+        body = {}
+    analysis = body.get("analysis")
+    if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
+        return respond(400, {"error": "invalid analysis"})
+    result = run_publish(event, user, analysis)
+    return respond(409 if "error" in result else 200, result)
+
+
+def run_publish(event, user, analysis):
+    domain = event.get("requestContext", {}).get("domainName", "")
+    response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(
+        {"__tool": "publish_dashboards", "_caller": bearer(event), "_analysis": analysis,
+         "_chat_url": f"https://{domain}"}).encode("utf-8"))
+    result = json.loads(response["Payload"].read() or b"{}")
+    print(json.dumps({"user": user["sub"], "event": "publish_dashboards", "ok": "error" not in result,
+                      "published": result.get("published"), "error": result.get("error")}, ensure_ascii=False))
+    return result
+
+
+# "发布到仪表盘" typed in the chat runs the same publish as the button, here and without the model (which could
+# answer from the conversation history instead of acting). Short requests only; questions and negations go to the model.
+PUBLISH_WORDS = re.compile(r"发布|更新|同步|推送")
+PUBLISH_TARGET = re.compile(r"仪表盘|仪表板|控制面板|看板|dashboard", re.I)
+NOT_PUBLISH = re.compile(r"不要|别|不用|无需|吗|？|\?|怎么|如何|为什么|什么时候|能否|是否|会不会|撤销|改成|改为|新增|删除|画")
+
+
+def publish_command(prompt):
+    text = re.sub(r"\s+", "", prompt or "")
+    return bool(text) and len(text) <= 30 and bool(PUBLISH_WORDS.search(text) and PUBLISH_TARGET.search(text)) \
+        and not NOT_PUBLISH.search(text)
+
+
+def answer_directly(user, answer, steps):
+    """Store a finished job (no Runtime call) so the page shows it like any other answer."""
+    job_id, now = uuid.uuid4().hex, int(time.time())
+    jobs.put_item(Item={"jobId": job_id, "status": "SUCCEEDED", "owner": user["sub"], "createdAt": now, "heartbeatAt": now,
+                        "expiresAt": now + JOB_TTL_SECONDS,
+                        "result": json.dumps({"answer": answer, "steps": steps, "model": "（直接执行）", "totalMs": 0},
+                                             ensure_ascii=False)})
+    return job_id
+
+
 def handler(event, context):
     http = event.get("requestContext", {}).get("http", {})
     method, path = http.get("method", ""), event.get("rawPath", "/")
@@ -279,6 +340,8 @@ def handler(event, context):
         return submit(event, user)
     if method == "POST" and re.fullmatch(r"/changes/[0-9a-f]{32}/apply", path):
         return apply_change(path.split("/")[2], event, user)
+    if method == "POST" and path == "/dashboards/publish":
+        return publish_dashboards(event, user)
     if method == "POST" and re.fullmatch(r"/jobs/[0-9a-f]{32}/cancel", path):
         return cancel(path.split("/")[2], user)
     if method == "GET" and re.fullmatch(r"/jobs/[0-9a-f]{32}", path):

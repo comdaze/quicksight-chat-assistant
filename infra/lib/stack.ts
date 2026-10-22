@@ -106,6 +106,12 @@ export class ChatAssistantStack extends Stack {
     analysisFn.addToRolePolicy(quicksightPeople);
     analysisFn.addToRolePolicy(quicksightDashboards);
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:UpdateAnalysis'], resources: analysisResources }));
+    // The 发布到仪表盘 button: publish the analysis to its dashboards (users' dashboard permissions checked in code).
+    analysisFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['quicksight:DescribeDashboardDefinition', 'quicksight:UpdateDashboard', 'quicksight:UpdateDashboardPublishedVersion',
+        'quicksight:TagResource'],
+      resources: [`${qs}:dashboard/*`],
+    }));
     // Column names and types for validating conversational edits.
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:DescribeDataSet'], resources: [`${qs}:dataset/*`] }));
     // UpdateAnalysis requires PassDataSet on every dataset the definition references.

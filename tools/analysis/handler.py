@@ -24,6 +24,7 @@ import boto3
 import caller
 import definition as defs
 import edits
+import publisher
 from caller import ToolError, log
 
 BUCKET = os.environ["BACKUP_BUCKET"]
@@ -224,8 +225,41 @@ def undo_last_visual_change(args):
             "message": "已撤销，请手动刷新页面查看。"}
 
 
+def publish_dashboards(args):
+    """The 发布到仪表盘 button (web Lambda only, never the model): publish the analysis as it is now to every dashboard
+    published from it that this user may update, with the chat marked as running in a dashboard."""
+    email, aid = caller.require_editor(args)
+    chat_url = str(args.get("_chat_url") or "")
+    if not chat_url.startswith("https://"):
+        raise ToolError("缺少聊天页地址")
+    name, definition = _analysis(aid)
+    arns = caller.principals(email)
+    published, skipped = [], []
+    for dashboard_id in caller.dashboards_of(aid):
+        perms = qs.describe_dashboard_permissions(AwsAccountId=caller.ACCOUNT, DashboardId=dashboard_id).get("Permissions", [])
+        if not all(caller._has(perms, arns, a) for a in ("quicksight:UpdateDashboard", "quicksight:UpdateDashboardPublishedVersion")):
+            skipped.append(dashboard_id)
+            continue
+        current = qs.describe_dashboard_definition(AwsAccountId=caller.ACCOUNT, DashboardId=dashboard_id)
+        draft = json.loads(json.dumps(definition, default=str))
+        publisher.mark(draft, chat_url)
+        try:
+            version = publisher.publish_definition(dashboard_id, current["Name"], draft, current.get("DashboardPublishOptions"),
+                                                   f"published from the chat by {email}", aid)
+        except RuntimeError as error:
+            raise ToolError(f"发布到仪表盘“{current['Name']}”失败：{error}") from error
+        published.append({"dashboard_id": dashboard_id, "name": current["Name"], "version": version})
+        log(event="dashboard_published", by=email, analysis=aid, dashboard=dashboard_id, version=version)
+    if not published:
+        raise ToolError("没有你可以发布的仪表盘：这个分析还没发布过仪表盘（第一次请在 QuickSight 控制台发布），"
+                        "或你没有更新它的权限" + (f"（{len(skipped)} 个仪表盘无权限）" if skipped else ""))
+    return {"published": published, "skipped": len(skipped),
+            "message": "已发布。打开仪表盘后刷新页面即可看到（刚发布时图表可能短暂报错，再刷新一次）。"}
+
+
 TOOLS = {"describe_analysis": describe_analysis, "preview_analysis_change": preview_analysis_change,
-         "apply_pending_change": apply_pending_change, "undo_last_visual_change": undo_last_visual_change}
+         "apply_pending_change": apply_pending_change, "undo_last_visual_change": undo_last_visual_change,
+         "publish_dashboards": publish_dashboards}
 
 
 def handler(event, context):
@@ -234,8 +268,8 @@ def handler(event, context):
     custom = getattr(getattr(context, "client_context", None), "custom", None) or {}
     if custom.get("bedrockAgentCoreToolName"):
         name = custom["bedrockAgentCoreToolName"].split("___", 1)[-1]
-        if name == "apply_pending_change":  # defence in depth: never reachable through the gateway
-            return {"error": "apply_pending_change 只能由聊天页的按钮触发"}
+        if name in ("apply_pending_change", "publish_dashboards"):  # defence in depth: not on the gateway
+            return {"error": f"{name} 只能由聊天页的按钮触发"}
     tool = TOOLS.get(name)
     if tool is None:
         return {"error": f"unknown tool {name!r}"}

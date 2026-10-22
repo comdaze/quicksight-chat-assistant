@@ -161,6 +161,18 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&a
 const MD_TAGS = ["p", "br", "strong", "em", "b", "i", "del", "s", "code", "pre", "blockquote", "ul", "ol", "li",
   "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td", "a", "span", "div"];
 const MD_ATTRS = ["href", "title", "align", "start", "class"];
+// CommonMark does not close "**" after punctuation when a letter follows, so "**结论：**省内…" (common in Chinese)
+// stays literal. Bold any "**…**" span on one line whose ends are not spaces; code spans are tokenized first.
+if (window.marked) {
+  marked.use({ extensions: [{
+    name: "cjkStrong", level: "inline",
+    start(src) { const i = src.indexOf("**"); return i < 0 ? undefined : i; },
+    tokenizer(src) {
+      const match = /^\*\*(?![\s*])([^\n]*?[^\s*])\*\*(?!\*)/.exec(src);
+      if (match) return { type: "strong", raw: match[0], text: match[1], tokens: this.lexer.inlineTokens(match[1]) };
+    },
+  }] });
+}
 if (window.DOMPurify) {
   DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     if (node.tagName === "A") {
@@ -405,9 +417,19 @@ function chartOption(spec) {
   };
 }
 function changeText(change) { return change.summary || `把“${change.title}”改为${change.to}`; }  // older history entries
-function previewHtml(change, status) {
+// turn.changes[id]: "applied" | "discarded" | {status: "published" | "kept", note}
+function previewHtml(change, state) {
   if (!change) return "";
-  if (status === "applied") return `<div class="box done"><p>✓ 已应用到分析：${escapeHtml(changeText(change))}。请手动刷新页面查看。</p></div>`;
+  const status = state && typeof state === "object" ? state.status : state;
+  const done = `✓ 已应用到分析：${escapeHtml(changeText(change))}。请手动刷新页面查看。`;
+  if (status === "published") return `<div class="box done"><p>${done}</p><p class="note">✓ ${escapeHtml(state.note || "已发布到仪表盘")}</p></div>`;
+  if (status === "kept") return `<div class="box done"><p>${done}</p><p class="note">没有发布仪表盘；需要时在 QuickSight 里发布，或再改一次后点“发布到仪表盘”。</p></div>`;
+  if (status === "applied") {
+    if (IN_DASHBOARD) return `<div class="box done"><p>${done}</p></div>`;
+    return `<div class="box done" data-publish="${escapeHtml(change.id)}"><p>${done}</p>
+      <p class="note">仪表盘不会自动更新。要把分析的当前内容发布到由它发布的仪表盘吗？</p>
+      <button type="button" class="primary publish-dashboard">发布到仪表盘</button><button type="button" class="skip-publish">不用了</button></div>`;
+  }
   if (status === "discarded") return `<div class="box off"><p>已放弃，分析未修改。</p></div>`;
   if (Date.now() / 1000 > change.expires_at) return `<div class="box off"><p>预览已过期，分析未修改。需要的话请重新提出修改。</p></div>`;
   return `<div class="box" data-change="${escapeHtml(change.id)}"><p>预览：${escapeHtml(changeText(change))}。分析尚未修改。</p>
@@ -444,10 +466,39 @@ function mountCharts(container, list, turn) {
       });
     }).catch((error) => container.querySelectorAll(".chart").forEach((node) => { node.style.height = "auto"; node.textContent = error.message; }));
   }
-  container.querySelectorAll(".box[data-change]").forEach((box) => {
-    const id = box.dataset.change;
+  container.querySelectorAll(".box[data-change], .box[data-publish]").forEach((box) => wireChangeBox(box, list, turn));
+}
+function wireChangeBox(box, list, turn) {
+    const id = box.dataset.change || box.dataset.publish;
     const change = list.find((c) => c.pending_change && c.pending_change.id === id).pending_change;
-    const settle = (status) => { turn.changes = { ...(turn.changes || {}), [id]: status }; saveHistory(); box.outerHTML = previewHtml(change, status); };
+    const settle = (status) => {
+      turn.changes = { ...(turn.changes || {}), [id]: status }; saveHistory();
+      const holder = document.createElement("div");
+      holder.innerHTML = previewHtml(change, status);
+      const next = holder.firstElementChild;
+      box.replaceWith(next);
+      if (next.matches(".box[data-publish]")) wireChangeBox(next, list, turn);
+    };
+    const failNote = (text) => {
+      let note = box.querySelector(".note.err");
+      if (!note) { note = document.createElement("p"); note.className = "note err"; box.append(note); }
+      note.textContent = text;
+    };
+    if (box.dataset.publish) {
+      box.querySelector(".skip-publish").onclick = () => settle({ status: "kept" });
+      box.querySelector(".publish-dashboard").onclick = async (event) => {
+        event.target.disabled = true; event.target.textContent = "正在发布…";
+        try {
+          const result = await api("/dashboards/publish", { method: "POST", body: JSON.stringify({ analysis: ANALYSIS }) });
+          const names = (result.published || []).map((d) => `“${d.name}”（第 ${d.version} 版）`).join("、");
+          settle({ status: "published", note: `已发布到仪表盘 ${names}。打开仪表盘后刷新即可看到；刚发布时图表可能短暂报错，再刷新一次。` });
+        } catch (error) {
+          event.target.disabled = false; event.target.textContent = "发布到仪表盘";
+          failNote(`没有发布：${error.message}`);
+        }
+      };
+      return;
+    }
     box.querySelector(".discard-change").onclick = () => settle("discarded");
     box.querySelector(".apply-change").onclick = async (event) => {
       event.target.disabled = true; event.target.textContent = "正在应用…";
@@ -456,12 +507,9 @@ function mountCharts(container, list, turn) {
         settle("applied");
       } catch (error) {
         event.target.disabled = false; event.target.textContent = "应用到分析";
-        let note = box.querySelector(".note.err");
-        if (!note) { note = document.createElement("p"); note.className = "note err"; box.append(note); }
-        note.textContent = `没有应用：${error.message}`;
+        failNote(`没有应用：${error.message}`);
       }
     };
-  });
 }
 
 // ---- Conversation: this browser keeps the last 20 turns per user and analysis for 8 hours ----
