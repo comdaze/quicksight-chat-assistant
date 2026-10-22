@@ -137,7 +137,8 @@ def login_finish(event):
     except Exception as error:  # noqa: BLE001
         print(json.dumps({"auth": "error", "error": repr(error)[:500]}, ensure_ascii=False))
         return respond(500, popup_page("登录失败", "签名或断言校验出错，请稍后重试。"), POPUP_HEADERS)
-    print(json.dumps({"auth": "ok", "sub": payload["sub"], "exp": payload["exp"]}, ensure_ascii=False))
+    print(json.dumps({"auth": "ok", "sub": payload["sub"], "exp": payload["exp"],
+                      "name_source": payload.get("name_source"), "saml_attributes": _attributes}, ensure_ascii=False))
     message = {"type": "qsca-auth", "nonce": nonce, "token": token,
                "user": {"sub": payload["sub"], "name": payload["name"], "exp": payload["exp"]}}
     return respond(200, popup_page("登录成功", "正在返回聊天窗口…", message, origin(event)), POPUP_HEADERS)

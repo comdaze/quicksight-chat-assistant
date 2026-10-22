@@ -22,6 +22,7 @@ import uuid
 import zlib
 
 import boto3
+from botocore.config import Config
 from lxml import etree
 from signxml import XMLVerifier
 from signxml.exceptions import SignXMLException
@@ -247,9 +248,39 @@ def complete_login(table, saml_response_b64, relay_state, acs_url):
         attr.get("Name"): attr.findtext("saml:AttributeValue", namespaces=NS)
         for attr in assertion.findall("saml:AttributeStatement/saml:Attribute", NS)
     }
-    name = display_name(attributes) or subject
-    token, payload = mint_session(subject.lower(), name)
+    name = display_name(attributes)
+    source = "assertion" if name else ""
+    if not name:
+        name = directory_name(subject)
+        source = "directory" if name else "email"
+    token, payload = mint_session(subject.lower(), name or subject)
+    payload["name_source"] = source
     return token, payload, pending["nonce"], sorted(attributes)
+
+
+_identity_store = {}
+
+
+def directory_name(email):
+    """The user's name from the Identity Center identity store, looked up by email. Best effort: any failure (no
+    permission, user not found, timeout) just means the chat page shows the email."""
+    try:
+        if "client" not in _identity_store:
+            region = os.environ.get("IDENTITY_CENTER_REGION") or None
+            config = Config(connect_timeout=2, read_timeout=3, retries={"max_attempts": 2})
+            store_id = os.environ.get("IDENTITY_STORE_ID") or \
+                boto3.client("sso-admin", region_name=region, config=config).list_instances()["Instances"][0]["IdentityStoreId"]
+            _identity_store.update(client=boto3.client("identitystore", region_name=region, config=config), id=store_id)
+        client, store_id = _identity_store["client"], _identity_store["id"]
+        user_id = client.get_user_id(IdentityStoreId=store_id, AlternateIdentifier={
+            "UniqueAttribute": {"AttributePath": "emails.value", "AttributeValue": email}})["UserId"]
+        user = client.describe_user(IdentityStoreId=store_id, UserId=user_id)
+        name = user.get("Name") or {}
+        return display_name({"familyName": name.get("FamilyName"), "givenName": name.get("GivenName"),
+                             "displayName": user.get("DisplayName")})
+    except Exception as error:  # noqa: BLE001 - the name is cosmetic; never fail a login over it
+        print(json.dumps({"auth": "name_lookup_failed", "error": repr(error)[:200]}))
+        return ""
 
 
 CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")

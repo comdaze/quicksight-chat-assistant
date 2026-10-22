@@ -21,7 +21,12 @@ export interface AppConfig {
   prefix: string;
   region: string;
   quickSight: { namespace: string; allowedAnalysisIds: string[] };
-  identityCenter: { samlEntityId: string };
+  identityCenter: {
+    samlEntityId: string;
+    /** Optional: where to look up users' names (default: the deployment region, its only Identity Center instance). */
+    identityStoreId?: string;
+    region?: string;
+  };
   dataAccess: {
     /** Where the data tool Lambda runs so it can reach the databases behind QuickSight datasets; null = no VPC. */
     vpc: null | { vpcId: string; subnetIds: string[]; securityGroupIds: string[]; createInterfaceEndpoints: boolean };

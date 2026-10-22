@@ -112,9 +112,11 @@ Custom SAML applications cannot be created by API.
 1. IAM Identity Center → **Applications** → **Add application** → **I have an application I want to set up** → **SAML 2.0**.
 2. Download the **IAM Identity Center metadata** file.
 3. Application ACS URL = output `AcsUrl`; application SAML audience = output `SamlEntityId`.
-4. **Actions → Edit attribute mappings**: `Subject` → `${user:email}`, format `emailAddress`. Optional, to show the
-   user's name instead of the email: add `familyName` → `${user:familyName}` and `givenName` → `${user:givenName}`
-   (format `unspecified`; CJK names are shown family name first, e.g. 杨志浩). Users see it after signing in again.
+4. **Actions → Edit attribute mappings**: `Subject` → `${user:email}`, format `emailAddress`. The chat page shows the
+   user's name: it is read at sign-in from the identity store by email (CJK names family name first, e.g. 杨志浩).
+   Optional SAML attributes `familyName` → `${user:familyName}` and `givenName` → `${user:givenName}` take
+   precedence. If Identity Center lives in another account or region, set `identityCenter.identityStoreId` /
+   `region`; when the lookup is not possible the email is shown.
 5. **Assign users and groups** who may use the assistant.
 6. Upload the metadata (takes effect within 5 minutes, no redeploy):
 
@@ -326,7 +328,7 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 1. **前提**：QuickSight 企业版且用 IAM Identity Center 登录（邮箱一致）；OpenAI 兼容模型端点；部署机器有 Node.js 20+、Python 3.9+（pip、boto3），能访问 npm 与 PyPI；目标账号区域执行过一次 `cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>`。
 2. **配置**：`cp config.example.json config.json`，按英文部分的配置表填写（前缀、区域、SAML 受众、数据工具 Lambda 的 VPC 子网、是否创建接口端点、数据源密钥前缀、企业 MCP；可选 `examples` 自定义聊天页的示例问题，便于针对客户数据演示）。数据库在 VPC 内时，推荐直接使用 QuickSight VPC 连接所在的子网。
 3. **部署**：`./qsca --profile <p> deploy`，完成后 `./qsca --profile <p> outputs` 查看 `ChatUrl`、`AcsUrl`、`SamlEntityId`、`ModelSecretName`。
-4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`（可选：再加 `familyName` = `${user:familyName}`、`givenName` = `${user:givenName}`，格式 `unspecified`，聊天窗口就显示姓名而不是邮箱，中文名按"姓+名"显示，用户重新登录后生效）；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
+4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`（聊天窗口显示的姓名在登录时按邮箱从 Identity Center 用户目录读取，中文名按"姓+名"显示；断言里的 `familyName`、`givenName` 属性优先；Identity Center 在其他账号或区域时配置 `identityCenter.identityStoreId` / `region`，查不到就显示邮箱）；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
 5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效；或 `./qsca model`。可选 `max_retries`（默认 4）在模型返回 429、5xx 或连接失败时重试；可选 `params` 给每个请求附加字段（如 `{"reasoning_effort":"medium"}`）。使用 Amazon Bedrock 时 `base_url` 填 `https://bedrock-runtime.<区域>.amazonaws.com/openai/v1`、`api_key` 填 Bedrock API Key（Kimi K3 的模型 ID 如 `global.moonshotai.kimi-k3`（全球路由）或 `us.moonshotai.kimi-k3`（仅美国区域），建议 `params` 为 `{"reasoning_effort":"medium","max_tokens":8192}`；实测 `us.` 比 `global.` 快 2 到 5 倍，`low` 在修改分析类请求上会卡死；无论推理档位和温度，约六分之一的回答会变成乱码，直到 `max_tokens` 才结束，所以必须设 `max_tokens`；偶发的 500 会自动重试）；中国区没有 Bedrock，从中国区调用会跨境访问海外区域，需确认数据合规。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
 6. **数据库凭证**：为分析用到的每个 QuickSight 数据源，在同一区域创建只读账号密钥 `<前缀><DataSourceId>`，内容 `{"username","password"}`（`./qsca datasource-secret <DataSourceId>`）；数据库安全组放行数据工具 Lambda。
 7. **接入分析**：`./qsca --profile <p> attach <分析ID> --apply`（只打印地址时去掉 `--apply`；`--replace <visual_id>` 可替换已有图表的位置），然后在 QuickSight 发布仪表盘。可选：建参数 `pViewer`（动态默认值为当前用户邮箱），用于检测同一浏览器切换了 QuickSight 用户。

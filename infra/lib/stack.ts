@@ -239,6 +239,7 @@ export class ChatAssistantStack extends Stack {
     runtime.node.addDependency(runtimeRole);
 
     // ---- Web Lambda + HTTP API (chat page, SAML login, jobs, apply button) ----
+    const identityRegion = config.identityCenter.region ?? this.region;
     const webFn = new lambda.Function(this, 'Web', {
       functionName: `${prefix}-web`, runtime: lambda.Runtime.PYTHON_3_12, architecture: lambda.Architecture.ARM_64,
       handler: 'handler.handler', code: lambda.Code.fromAsset(path.join(BUILD, 'web')),
@@ -248,6 +249,7 @@ export class ChatAssistantStack extends Stack {
         ANALYSIS_TOOLS_FN: analysisFn.functionName, SESSION_SECRET_ID: sessionKey.secretName,
         IDP_METADATA_PARAMETER: idpParameter, SAML_SP_ENTITY_ID: config.identityCenter.samlEntityId,
         FRAME_ANCESTORS: config.frameAncestors, EXAMPLES_JSON: JSON.stringify(config.examples ?? []),
+        IDENTITY_STORE_ID: config.identityCenter.identityStoreId ?? '', IDENTITY_CENTER_REGION: identityRegion,
       },
       description: 'Chat page, IAM Identity Center SAML login and job API for the QuickSight chat assistant.',
     });
@@ -261,6 +263,15 @@ export class ChatAssistantStack extends Stack {
     webFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParameter'], resources: [`arn:${partition}:ssm:${this.region}:${this.account}:parameter${idpParameter}`],
     }));
+    // Display names: read-only lookup of the signed-in user (by email) in the Identity Center identity store.
+    const store = config.identityCenter.identityStoreId ?? '*';
+    webFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['identitystore:GetUserId', 'identitystore:DescribeUser'],
+      resources: [`arn:${partition}:identitystore::${this.account}:identitystore/${store}`, `arn:${partition}:identitystore:::user/*`],
+    }));
+    if (!config.identityCenter.identityStoreId) {
+      webFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['sso:ListInstances'], resources: ['*'] }));
+    }
     const api = new apigw.HttpApi(this, 'Api', {
       apiName: `${prefix}-api`, defaultIntegration: new apigwIntegrations.HttpLambdaIntegration('WebIntegration', webFn),
     });
