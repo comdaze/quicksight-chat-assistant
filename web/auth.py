@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -246,6 +247,20 @@ def complete_login(table, saml_response_b64, relay_state, acs_url):
         attr.get("Name"): attr.findtext("saml:AttributeValue", namespaces=NS)
         for attr in assertion.findall("saml:AttributeStatement/saml:Attribute", NS)
     }
-    name = attributes.get("username") or subject
+    name = display_name(attributes) or subject
     token, payload = mint_session(subject.lower(), name)
     return token, payload, pending["nonce"], sorted(attributes)
+
+
+CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+
+
+def display_name(attributes):
+    """Readable user name from optional SAML attributes (Identity Center attribute mappings, see README):
+    familyName/givenName -> "杨志浩" for CJK names (family name first, no space) or "Sean Yang"; else displayName/name.
+    The value is only shown in the chat page; the email Subject stays the identity."""
+    clean = {k: " ".join(str(v or "").split())[:100] for k, v in attributes.items()}
+    family, given = clean.get("familyName", ""), clean.get("givenName", "")
+    if family and given:
+        return f"{family}{given}" if CJK.search(family + given) else f"{given} {family}"
+    return clean.get("displayName") or clean.get("name") or clean.get("username") or given or ""

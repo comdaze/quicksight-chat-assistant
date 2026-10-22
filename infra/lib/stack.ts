@@ -247,7 +247,7 @@ export class ChatAssistantStack extends Stack {
         RUNTIME_ARN: runtime.attrAgentRuntimeArn, RUNTIME_VERSION: runtime.attrAgentRuntimeVersion, JOBS_TABLE: jobs.tableName,
         ANALYSIS_TOOLS_FN: analysisFn.functionName, SESSION_SECRET_ID: sessionKey.secretName,
         IDP_METADATA_PARAMETER: idpParameter, SAML_SP_ENTITY_ID: config.identityCenter.samlEntityId,
-        FRAME_ANCESTORS: config.frameAncestors,
+        FRAME_ANCESTORS: config.frameAncestors, EXAMPLES_JSON: JSON.stringify(config.examples ?? []),
       },
       description: 'Chat page, IAM Identity Center SAML login and job API for the QuickSight chat assistant.',
     });

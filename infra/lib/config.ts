@@ -32,6 +32,8 @@ export interface AppConfig {
   runtime: { idleSeconds: number; maxLifetimeSeconds: number };
   api: { rateLimit: number; burstLimit: number };
   frameAncestors: string;
+  /** Optional example questions shown in the chat page, replacing the built-in generic ones. */
+  examples?: { group: string; tip?: string; questions: string[] }[];
 }
 
 export function loadConfig(path: string): AppConfig {
@@ -48,6 +50,8 @@ export function loadConfig(path: string): AppConfig {
     }
     if (!target.endpoint?.startsWith('https://')) problems.push(`mcpTargets "${target.name}": endpoint must be https://`);
   }
+  const examples = Buffer.byteLength(JSON.stringify(config.examples ?? []), 'utf8');
+  if (examples > 2500) problems.push(`examples: ${examples} bytes as JSON; keep under 2500 (Lambda environment variables share a 4 KB limit)`);
   if (problems.length) throw new Error(`config ${path}:\n  - ${problems.join('\n  - ')}`);
   return config;
 }

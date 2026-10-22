@@ -35,6 +35,19 @@ class SqlCompileTest(unittest.TestCase):
         self.assertTrue(sql.endswith("LIMIT 201"))
         self.assertEqual(limit, 200)
 
+    def test_tolerates_garbled_list_keys(self):
+        # Key names actually sent by Kimi K3 for between; each used to cost a failed call and a model round trip.
+        for flt in ({"values[]": ["2026-01-01", "2026-03-31"]}, {"values 范围内": ["2026-01-01", "2026-03-31"]},
+                    {"values[1]": "2026-03-31", "values[0]": "2026-01-01"}):
+            _sql, params, _out, _limit = sc.compile_query(
+                {"metrics": [{"column": "price", "agg": "avg"}], "filters": [{"column": "t", "op": "between", **flt}]},
+                COLUMNS, TABLE, sc.DIALECTS["postgresql"])
+            self.assertEqual(params, {"p0": "2026-01-01", "p1": "2026-03-31"}, flt)
+        with self.assertRaisesRegex(sc.QueryError, '"values"'):
+            sc.compile_query({"metrics": [{"column": "price", "agg": "avg"}],
+                              "filters": [{"column": "t", "op": "between", "values ": "2026-01-01"}]},
+                             COLUMNS, TABLE, sc.DIALECTS["postgresql"])
+
     def test_mysql_quoting_and_percent_escaping(self):
         sql, params, _out, _limit = sc.compile_query(
             {"metrics": [{"agg": "count"}], "time": {"column": "t", "grain": "month"},

@@ -96,6 +96,7 @@ cp config.example.json config.json
 | `mcpTargets` | Enterprise MCP servers (see below); `[]` for none |
 | `runtime.idleSeconds` / `maxLifetimeSeconds` | Session idle timeout (300) and max lifetime (28800 = 8 h, also the longest job) |
 | `api.rateLimit` / `burstLimit` | HTTP API throttling |
+| `examples` | Optional example questions for the chat page, replacing the built-in generic ones: `[{"group": "…", "tip": "…", "questions": ["…"]}]`, at most 2500 bytes as JSON. Use it to tailor a demo to your data |
 
 ### 2. Deploy
 
@@ -111,7 +112,9 @@ Custom SAML applications cannot be created by API.
 1. IAM Identity Center → **Applications** → **Add application** → **I have an application I want to set up** → **SAML 2.0**.
 2. Download the **IAM Identity Center metadata** file.
 3. Application ACS URL = output `AcsUrl`; application SAML audience = output `SamlEntityId`.
-4. **Actions → Edit attribute mappings**: `Subject` → `${user:email}`, format `emailAddress`.
+4. **Actions → Edit attribute mappings**: `Subject` → `${user:email}`, format `emailAddress`. Optional, to show the
+   user's name instead of the email: add `familyName` → `${user:familyName}` and `givenName` → `${user:givenName}`
+   (format `unspecified`; CJK names are shown family name first, e.g. 杨志浩). Users see it after signing in again.
 5. **Assign users and groups** who may use the assistant.
 6. Upload the metadata (takes effect within 5 minutes, no redeploy):
 
@@ -128,7 +131,22 @@ In Secrets Manager, edit `<prefix>/model-config` (output `ModelSecretName`) as p
 ```
 
 Takes effect within 60 seconds; switching models is just editing this secret. Or run `./qsca --profile <p> model`.
+Optional `max_retries` (default 4) retries model calls that fail with 429, 5xx or a connection error.
+Optional `params` adds fields to every Chat Completions request (for example `{"reasoning_effort": "medium"}`).
 Questions and query results are sent to this endpoint: make sure it meets your data compliance rules and uses HTTPS.
+
+Amazon Bedrock (Chat Completions on the `bedrock-runtime` endpoint, Bedrock API key), for example Kimi K3:
+
+```json
+{"base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1", "model": "global.moonshotai.kimi-k3",
+ "api_key": "<Bedrock API key>", "timeout": 180, "params": {"reasoning_effort": "medium", "max_tokens": 8192}}
+```
+
+Bedrock is not offered in the AWS China regions, so from China this calls a global region across the border; check
+that this is acceptable for the data. Kimi K3 reasons at `max` effort by default, which is slow for an interactive
+chat. Use `medium`: in testing, `low` sometimes produced endless garbled reasoning on analysis-edit requests (3 of 3
+runs hung), while `medium` and `none` did not. Keep `max_tokens` as a safety net: a runaway answer then fails after
+a minute with a clear message instead of running until the job times out.
 
 ### 5. Database credentials (built-in data queries)
 
@@ -190,7 +208,8 @@ These servers never receive the user's identity: expose read-only tools only.
 ## Use
 
 1. Open an analysis or dashboard with the assistant, click **Sign in with Identity Center** (usually no password when
-   already signed in to QuickSight). The session lasts 8 hours.
+   already signed in to QuickSight). The session lasts 8 hours. Example questions sit in the collapsed **示例问题** bar
+   under the input box, one tab per capability; clicking one asks it.
 2. Ask, for example:
    - *Which visuals does this analysis have and what do they show?*
    - *Under the current filters, how did the average price trend last month? Draw it.*
@@ -301,10 +320,10 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 ## 部署
 
 1. **前提**：QuickSight 企业版且用 IAM Identity Center 登录（邮箱一致）；OpenAI 兼容模型端点；部署机器有 Node.js 20+、Python 3.9+（pip、boto3），能访问 npm 与 PyPI；目标账号区域执行过一次 `cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>`。
-2. **配置**：`cp config.example.json config.json`，按英文部分的配置表填写（前缀、区域、SAML 受众、数据工具 Lambda 的 VPC 子网、是否创建接口端点、数据源密钥前缀、企业 MCP）。数据库在 VPC 内时，推荐直接使用 QuickSight VPC 连接所在的子网。
+2. **配置**：`cp config.example.json config.json`，按英文部分的配置表填写（前缀、区域、SAML 受众、数据工具 Lambda 的 VPC 子网、是否创建接口端点、数据源密钥前缀、企业 MCP；可选 `examples` 自定义聊天页的示例问题，便于针对客户数据演示）。数据库在 VPC 内时，推荐直接使用 QuickSight VPC 连接所在的子网。
 3. **部署**：`./qsca --profile <p> deploy`，完成后 `./qsca --profile <p> outputs` 查看 `ChatUrl`、`AcsUrl`、`SamlEntityId`、`ModelSecretName`。
-4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
-5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效；或 `./qsca model`。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
+4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`（可选：再加 `familyName` = `${user:familyName}`、`givenName` = `${user:givenName}`，格式 `unspecified`，聊天窗口就显示姓名而不是邮箱，中文名按"姓+名"显示，用户重新登录后生效）；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
+5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效；或 `./qsca model`。可选 `max_retries`（默认 4）在模型返回 429、5xx 或连接失败时重试；可选 `params` 给每个请求附加字段（如 `{"reasoning_effort":"medium"}`）。使用 Amazon Bedrock 时 `base_url` 填 `https://bedrock-runtime.<区域>.amazonaws.com/openai/v1`、`api_key` 填 Bedrock API Key（Kimi K3 的模型 ID 如 `global.moonshotai.kimi-k3`（全球路由）或 `us.moonshotai.kimi-k3`（仅美国区域），建议 `params` 为 `{"reasoning_effort":"medium","max_tokens":8192}`：实测 `low` 在修改分析类请求上会输出无尽的乱码推理）；中国区没有 Bedrock，从中国区调用会跨境访问海外区域，需确认数据合规。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
 6. **数据库凭证**：为分析用到的每个 QuickSight 数据源，在同一区域创建只读账号密钥 `<前缀><DataSourceId>`，内容 `{"username","password"}`（`./qsca datasource-secret <DataSourceId>`）；数据库安全组放行数据工具 Lambda。
 7. **接入分析**：`./qsca --profile <p> attach <分析ID> --apply`（只打印地址时去掉 `--apply`；`--replace <visual_id>` 可替换已有图表的位置），然后在 QuickSight 发布仪表盘。可选：建参数 `pViewer`（动态默认值为当前用户邮箱），用于检测同一浏览器切换了 QuickSight 用户。
 8. **自检**：`./qsca --profile <p> check --analysis <分析ID>`；管理员可用 `smoke` 和 `tests/e2e.py` 做端到端测试。
@@ -313,7 +332,7 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 
 ## 使用
 
-1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码），有效期 8 小时。
+1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码），有效期 8 小时。输入框下方折叠的 **示例问题** 栏按能力分标签列出了示例，展开后点击即可提问。
 2. 提问示例：
    - 这个分析有哪些图表，各自展示什么？
    - 按当前筛选，最近一个月的平均价格走势如何？画个图。

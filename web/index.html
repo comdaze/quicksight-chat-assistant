@@ -8,13 +8,13 @@
   :root{--ink:#16232b;--muted:#66747b;--line:#d9dfe2;--bg:#f6f8f9;--card:#fff;--brand:#0f7b72;--brand-soft:#e3f2ef;--err:#b3261e}
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--bg)}
-  .app{display:grid;grid-template-rows:auto auto 1fr auto;height:100%}
+  .app{display:grid;grid-template-rows:auto auto 1fr auto auto;height:100%}
   header{padding:10px 14px;border-bottom:1px solid var(--line);background:var(--card);display:flex;align-items:center;gap:10px}
   header h1{font-size:15px;margin:0}
   header .who{margin-left:auto;font-size:11px;color:var(--muted);display:flex;gap:8px;align-items:center}
   header .who button{font:inherit;font-size:11px;border:0;background:none;color:var(--brand);cursor:pointer;padding:0}
   .ctx{display:flex;flex-wrap:wrap;gap:6px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--card)}
-  .ctx:empty{display:none}
+  .ctx:empty{padding:0;border:0}  /* keep the grid row: hiding it would shift the 1fr row onto the input form */
   .chip{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--brand-soft);color:#0b5c55}
   #log{overflow:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
   .msg{max-width:92%;padding:8px 11px;border-radius:10px;white-space:normal;word-break:break-word}
@@ -24,13 +24,39 @@
   .msg.err{border-color:#f0c4c0;color:var(--err)}
   .msg.bot.cancelled{color:var(--muted);font-size:13px}
   .msg p{margin:0 0 6px}.msg p:last-child{margin:0}
-  .msg ul{margin:4px 0 4px 18px;padding:0}
+  .msg ul,.msg ol{margin:4px 0 6px 18px;padding:0}
+  .msg li>p{margin:0}
+  .msg h1,.msg h2,.msg h3,.msg h4,.msg h5,.msg h6{margin:10px 0 4px;line-height:1.35;color:#0b3f3a}
+  .msg h1{font-size:17px}.msg h2{font-size:16px}.msg h3{font-size:15px}.msg h4,.msg h5,.msg h6{font-size:14px}
+  .msg>:first-child{margin-top:0}
+  .msg hr{border:0;border-top:1px solid var(--line);margin:8px 0}
+  .msg blockquote{margin:6px 0;padding:2px 10px;border-left:3px solid var(--brand-soft);color:var(--muted)}
+  .msg pre{margin:6px 0;padding:6px 8px;background:#f1f4f5;border-radius:6px;overflow:auto}
+  .msg pre code{padding:0;background:none}
+  .msg .md-table{overflow:auto;margin:6px 0}
+  .msg table{border-collapse:collapse;font-size:12px}
+  .msg th,.msg td{border:1px solid var(--line);padding:3px 8px;text-align:left}
+  .msg th{background:var(--bg)}
+  .msg td[align=right],.msg th[align=right]{text-align:right}
+  .msg td[align=center],.msg th[align=center]{text-align:center}
+  .msg.bot a{color:var(--brand)}
   .steps{margin-top:6px;font-size:11px;color:var(--muted)}
   .steps summary{cursor:pointer}
   .steps code,.msg code{font-size:11px;background:#f1f4f5;padding:1px 4px;border-radius:4px}
   .hints{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
   .hints button{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--card);border-radius:999px;padding:4px 10px;cursor:pointer;color:var(--ink)}
   .hints button:hover{border-color:var(--brand);color:var(--brand)}
+  /* Example questions: a collapsed bar under the input box; expanding shows one tab per group */
+  .quick{background:var(--card);padding:0 14px 8px}
+  .quick-toggle{font:inherit;font-size:12px;border:0;background:none;color:var(--brand);cursor:pointer;padding:0;display:inline-flex;gap:4px;align-items:center}
+  .quick-toggle .arrow{display:inline-block;transition:transform .15s}
+  .quick-toggle[aria-expanded=true] .arrow{transform:rotate(180deg)}
+  .quick-panel{max-height:40vh;overflow:auto;margin-top:6px}
+  .quick-tabs{display:flex;flex-wrap:wrap;gap:2px 14px;border-bottom:1px solid var(--line)}
+  .quick-tabs button{font:inherit;font-size:12px;border:0;border-bottom:2px solid transparent;background:none;padding:2px 0 4px;margin-bottom:-1px;cursor:pointer;color:var(--muted)}
+  .quick-tabs button[aria-selected=true]{color:#0b5c55;border-bottom-color:var(--brand);font-weight:600}
+  .quick .note{margin:6px 0 0}
+  .quick .hints button:disabled{opacity:.5;cursor:default}
   .login{align-self:stretch;max-width:none;text-align:center;padding:18px}
   .login button{font:inherit;border:0;border-radius:8px;background:var(--brand);color:#fff;padding:8px 18px;cursor:pointer;margin-top:6px}
   .note{font-size:11px;color:var(--muted);margin:4px 0 0}
@@ -71,7 +97,18 @@
     <textarea id="q" placeholder="输入问题，Enter 发送，Shift+Enter 换行" maxlength="2000"></textarea>
     <button class="send" id="send" type="submit">发送</button>
   </form>
+  <section class="quick" id="quick" hidden>
+    <button type="button" class="quick-toggle" id="quickToggle" aria-expanded="false" aria-controls="quickPanel">示例问题 <span class="arrow" aria-hidden="true">▾</span></button>
+    <div class="quick-panel" id="quickPanel" hidden>
+      <div class="quick-tabs" id="quickTabs" role="tablist" aria-label="示例问题分组"></div>
+      <p class="note" id="quickTip"></p>
+      <div class="hints" id="quickList" role="tabpanel"></div>
+    </div>
+  </section>
 </div>
+<!-- Vendored, versioned copies served by the web Lambda (web/vendor/README.md); no CDN. -->
+<script src="/static/marked-18.1.1.umd.js"></script>
+<script src="/static/purify-3.4.17.min.js"></script>
 <script>
 // The embed URL is generated by `qsca attach`: ?analysis=<id>&viewer=<<$pViewer>>&p.<name>=<<$name>>...
 const params = new URLSearchParams(location.search);
@@ -117,7 +154,32 @@ for (const [name, value] of Object.entries(parameters)) {
 }
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+// Model answers are Markdown: parse with marked (GFM: headings, lists, tables), then sanitize with an allow-list.
+// No <img>/<iframe>/style: model output must not make the page fetch remote URLs (data exfiltration via prompt injection).
+const MD_TAGS = ["p", "br", "strong", "em", "b", "i", "del", "s", "code", "pre", "blockquote", "ul", "ol", "li",
+  "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td", "a", "span", "div"];
+const MD_ATTRS = ["href", "title", "align", "start", "class"];
+if (window.DOMPurify) {
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A") {
+      if (!/^https?:\/\//i.test(node.getAttribute("href") || "")) node.removeAttribute("href");
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+}
 function render(md) {
+  if (!window.marked || !window.DOMPurify) return renderPlain(md);
+  try {
+    const html = marked.parse(String(md), { gfm: true, breaks: true, async: false })
+      .replace(/<table>/g, '<div class="md-table"><table>').replace(/<\/table>/g, "</table></div>");
+    return DOMPurify.sanitize(html, { ALLOWED_TAGS: MD_TAGS, ALLOWED_ATTR: MD_ATTRS, ALLOW_DATA_ATTR: false });
+  } catch (e) {
+    return renderPlain(md);
+  }
+}
+// Fallback when the Markdown libraries failed to load: bold, inline code, bullet lists, paragraphs.
+function renderPlain(md) {
   const blocks = escapeHtml(md).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>").split(/\n{2,}/);
   return blocks.map((b) => {
     const lines = b.split("\n");
@@ -151,12 +213,15 @@ function setInputEnabled(enabled) {
   $("q").disabled = !enabled;
   $("send").disabled = !enabled;
   $("q").placeholder = enabled ? "输入问题，Enter 发送，Shift+Enter 换行" : "请先登录";
+  $("quick").hidden = !enabled;  // example questions only make sense once signed in
+  if (!enabled) setQuickOpen(false);
 }
 function renderWho() {
   $("who").innerHTML = "";
   if (!auth) return;
   const name = document.createElement("span");
   name.textContent = auth.user.name || auth.user.sub;
+  name.title = auth.user.sub;
   const out = document.createElement("button");
   out.type = "button"; out.textContent = "退出"; out.onclick = () => signOut("已退出。");
   $("who").append(name, out);
@@ -169,10 +234,69 @@ function signOut(message) {
   renderWho();
   showLogin(message);
 }
+// Example questions, one group per capability. A deployment can replace them (config.json "examples").
+const DEFAULT_EXAMPLES = [
+  { group: "了解分析", questions: [
+    "这个分析有哪些图表，各自展示什么？",
+    "这个分析用了哪些数据集和字段？",
+    "当前控件选了哪些值？它们会影响哪些图表？",
+  ] },
+  { group: "数据问答与出图", questions: [
+    "按当前筛选，主要指标最近的走势如何？画个图",
+    "按月汇总主要指标，并画出趋势图",
+    "按主要分类字段统计主要指标，前 5 名画柱状图对比",
+  ] },
+  { group: "计算分析（代码沙箱）", tip: "pandas 在无网络沙箱中计算", questions: [
+    "按月汇总主要指标，计算每月环比变化百分比，并画出环比图",
+    "按主要分类字段汇总主要指标，计算各自占总量的比例并排名",
+    "按日汇总主要指标，计算 7 日移动平均，和原始值画在同一张图上",
+    "按日汇总主要指标，找出偏离均值 2 倍标准差以上的异常日期",
+  ] },
+  { group: "控件联动", tip: "列出要在上方控件里选的值", questions: [
+    "在仪表盘上只看主要指标最大的那个分类",
+    "帮我把日期范围切到数据里的最后一个月",
+  ] },
+  { group: "修改分析", tip: "需要编辑权限，在分析编辑界面里使用；先预览，点“应用到分析”才生效", questions: [
+    "把第一个折线图改成柱状图，先给我看预览",
+    "把第一个折线图改成按月显示",
+    "给第一个图表换一个更清楚的标题",
+    "新增一个表格：按主要分类字段统计主要指标的平均值，按数值降序",
+    "新增一个柱状图：按主要分类字段统计主要指标的总和",
+    "撤销",
+  ] },
+];
+const EXAMPLES = (() => { try { const v = __EXAMPLES__; return Array.isArray(v) && v.length ? v : DEFAULT_EXAMPLES; } catch { return DEFAULT_EXAMPLES; } })();
+// Collapsed "示例问题" bar under the input box: one tab per group; clicking a question asks it and folds the panel.
+let quickGroup = 0;
+function setQuickOpen(open) {
+  $("quickToggle").setAttribute("aria-expanded", String(open));
+  $("quickPanel").hidden = !open;
+  if (open) renderQuick();
+}
+function renderQuick() {
+  const tabs = $("quickTabs"), list = $("quickList");
+  tabs.innerHTML = ""; list.innerHTML = "";
+  EXAMPLES.forEach((g, i) => {
+    const tab = document.createElement("button");
+    tab.type = "button"; tab.role = "tab"; tab.textContent = g.group;
+    tab.setAttribute("aria-selected", String(i === quickGroup));
+    tab.onclick = () => { quickGroup = i; renderQuick(); };
+    tabs.append(tab);
+  });
+  const group = EXAMPLES[quickGroup] || EXAMPLES[0];
+  $("quickTip").textContent = group.tip || "";
+  $("quickTip").hidden = !group.tip;
+  for (const q of group.questions || []) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = q; b.disabled = $("send").disabled;
+    b.onclick = () => { if ($("send").disabled) return; setQuickOpen(false); ask(q); };
+    list.append(b);
+  }
+}
+$("quickToggle").addEventListener("click", () => setQuickOpen($("quickPanel").hidden));
+$("quickPanel").addEventListener("keydown", (e) => { if (e.key === "Escape") { setQuickOpen(false); $("quickToggle").focus(); } });
 function showGreeting() {
-  const box = add("bot", `<p>你好${auth.user.name ? "，" + escapeHtml(auth.user.name) : ""}。我可以按当前控件的筛选查询这个分析的数据、画图解释变化，也可以帮你预览并修改分析里的图表类型。</p>
-    <div class="hints"><button type="button">这个分析有哪些图表，各自展示什么？</button><button type="button">按当前筛选，主要指标最近的走势如何？画个图</button><button type="button">哪个维度的值贡献最大？</button></div>`);
-  box.querySelector(".hints").addEventListener("click", (e) => { if (e.target.tagName === "BUTTON" && !$("send").disabled) ask(e.target.textContent); });
+  add("bot", `<p>你好${auth.user.name ? "，" + escapeHtml(auth.user.name) : ""}。我可以按当前控件的筛选查询这个分析的数据、计算并画图，提示控件该选什么值，也可以预览并修改分析里的图表。不知道问什么时，点输入框下方的“示例问题”展开常用问题。</p>`);
 }
 let loginBox = null;
 function showLogin(message) {

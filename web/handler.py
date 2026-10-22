@@ -2,7 +2,7 @@
 
 Routes:
   GET  /                       chat page (index.html)
-  GET  /static/<echarts file>  ECharts, versioned file name, cached for a year
+  GET  /static/<vendor file>   ECharts / marked / DOMPurify, versioned file names, cached for a year
   GET  /auth/login             start IAM Identity Center SAML login (popup)
   POST /saml/acs               SAML assertion consumer; hands a signed session token to the iframe
   GET  /me                     who is signed in
@@ -41,7 +41,8 @@ NONCE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
 JOB_TTL_SECONDS = 24 * 3600
 STALE_SECONDS = 150  # the Runtime heartbeats every 30 s
-ECHARTS_FILE = "echarts-6.1.0.min.js"
+# Third-party browser scripts vendored under web/vendor (see vendor/README.md); the page needs no CDN.
+STATIC_FILES = ("echarts-6.1.0.min.js", "marked-18.1.1.umd.js", "purify-3.4.17.min.js")
 
 jobs = boto3.resource("dynamodb").Table(JOBS_TABLE)
 lambda_client = boto3.client("lambda")
@@ -49,10 +50,17 @@ lambda_client = boto3.client("lambda")
 agentcore = boto3.client("bedrock-agentcore", config=Config(read_timeout=25, connect_timeout=5, retries={"max_attempts": 1}))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Optional example questions for the chat page: JSON [{"group", "tip"?, "questions": [...]}] (config.json "examples").
+EXAMPLES_JSON = os.environ.get("EXAMPLES_JSON", "") or "null"
 with open(os.path.join(HERE, "index.html"), encoding="utf-8") as page:
-    INDEX_HTML = page.read()
-with open(os.path.join(HERE, "vendor", ECHARTS_FILE), encoding="utf-8") as script:
-    ECHARTS_JS = script.read()
+    INDEX_HTML = page.read().replace("__EXAMPLES__", json.dumps(json.loads(EXAMPLES_JSON), ensure_ascii=True).replace("<", "\\u003c"))
+STATIC = {}
+for _name in STATIC_FILES:
+    with open(os.path.join(HERE, "vendor", _name), encoding="utf-8") as script:
+        STATIC[f"/static/{_name}"] = script.read()
+STATIC_HEADERS = {"Content-Type": "application/javascript; charset=utf-8",
+                  "Cache-Control": "public, max-age=31536000, immutable",
+                  "X-Content-Type-Options": "nosniff"}
 
 SECURITY_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff"}
 PAGE_HEADERS = {**SECURITY_HEADERS, "Content-Type": "text/html; charset=utf-8",
@@ -248,10 +256,8 @@ def handler(event, context):
     method, path = http.get("method", ""), event.get("rawPath", "/")
     if method == "GET" and path in ("/", "/index.html"):
         return respond(200, INDEX_HTML, PAGE_HEADERS)
-    if method == "GET" and path == f"/static/{ECHARTS_FILE}":
-        return respond(200, ECHARTS_JS, {"Content-Type": "application/javascript; charset=utf-8",
-                                         "Cache-Control": "public, max-age=31536000, immutable",
-                                         "X-Content-Type-Options": "nosniff"})
+    if method == "GET" and path in STATIC:
+        return respond(200, STATIC[path], STATIC_HEADERS)
     if method == "GET" and path == "/health":
         return respond(200, {"ok": True})
     if method == "GET" and path == "/auth/login":

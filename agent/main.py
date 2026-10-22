@@ -9,7 +9,9 @@ Invocation payloads (POST /invocations), sent by the web Lambda:
 - {"prompt", ...} without "job": answer synchronously (tests).
 
 Model: OpenAI-compatible endpoint from the Secrets Manager secret LLM_SECRET_ID (cached 60 s):
-{"base_url": "https://host/v1", "model": "name", "api_key": "...", "temperature": 0.2, "timeout": 120}.
+{"base_url": "https://host/v1", "model": "name", "api_key": "...", "temperature": 0.2, "timeout": 120,
+ "max_retries": 4, "params": {...extra Chat Completions fields, e.g. "reasoning_effort": "medium"}}.
+Amazon Bedrock works directly: base_url https://bedrock-runtime.<region>.amazonaws.com/openai/v1 with a Bedrock API key.
 
 Tools: everything on the AgentCore Gateway. Calls to this solution's own targets (TRUSTED_TARGETS) carry the user's
 signed session token, the analysis id and the current control values, added here in code (WithCaller) - the model
@@ -34,9 +36,10 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent, tool
-from strands.hooks import AfterToolCallEvent, BeforeModelCallEvent, BeforeToolCallEvent
+from strands.hooks import AfterModelCallEvent, AfterToolCallEvent, BeforeModelCallEvent, BeforeToolCallEvent
 from strands.models.openai import OpenAIModel
 from strands.tools.mcp import MCPClient
+from strands.types.exceptions import MaxTokensReachedException
 from strands.types.tools import AgentTool
 
 import charts
@@ -93,7 +96,11 @@ def llm_config():
         if not str(raw.get("base_url", "")).startswith(("https://", "http://")) or "<" in json.dumps(raw):
             raise ConfigError("管理员尚未配置模型：请在 Secrets Manager 中填写 base_url、model 和 api_key（见使用说明）")
         value = {"base_url": raw["base_url"].rstrip("/"), "model": raw["model"], "api_key": raw.get("api_key") or "none",
-                 "temperature": raw.get("temperature"), "timeout": int(raw.get("timeout", 120))}
+                 "temperature": raw.get("temperature"), "timeout": int(raw.get("timeout", 120)),
+                 # Retries on 429 / 5xx / connection errors (the OpenAI client backs off exponentially).
+                 "max_retries": int(raw.get("max_retries", 4)),
+                 # Extra Chat Completions request fields, e.g. {"reasoning_effort": "medium"} for reasoning models.
+                 "params": raw["params"] if isinstance(raw.get("params"), dict) else {}}
         _config.update(at=time.time(), value=value)
         return value
 
@@ -383,15 +390,50 @@ def run_agent(payload, cancel_signal=None):
     injected = {"_caller": token, "_analysis": analysis, "_parameters": parameters}
     user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
     steps, state = [], {"model_calls": 0, "charts": [], "controls": None, "results": {}}
+    # Where the time goes (logged with "answered"): setup = Gateway tool list + analysis summary; model_ms per call.
+    timing = {"model_ms": [], "tool_ms": 0, "mark": 0.0}
 
     def before_model(_event: BeforeModelCallEvent):
         state["model_calls"] += 1
+        timing["mark"] = stream["logged"] = time.time()
+
+    stream = {"chars": 0, "reasoning": 0, "tail": "", "logged": time.time()}
+
+    def on_stream(**event):
+        """Callback handler: notes streamed text; a model call that runs long logs its progress every 20 s."""
+        text, thinking = event.get("data"), event.get("reasoningText")
+        tool_use = event.get("current_tool_use")
+        if isinstance(tool_use, dict) and isinstance(tool_use.get("input"), str):
+            stream["tool_input"] = len(tool_use["input"])
+            stream["tail"] = tool_use["input"][-200:]
+        if isinstance(text, str):
+            stream["chars"] += len(text)
+            stream["tail"] = (stream["tail"] + text)[-200:]
+        if isinstance(thinking, str):
+            stream["reasoning"] += len(thinking)
+            stream["tail"] = (stream["tail"] + thinking)[-200:]
+        if time.time() - stream["logged"] > 20:
+            stream["logged"] = time.time()
+            log(event="model_streaming", since_s=int(time.time() - timing["mark"]), chars=stream["chars"],
+                reasoning_chars=stream["reasoning"], tool_input_chars=stream.get("tool_input", 0), tail=stream["tail"])
+
+    def after_model(event: AfterModelCallEvent):
+        ms = int((time.time() - timing["mark"]) * 1000)
+        timing["model_ms"].append(ms)
+        stop = event.stop_response.stop_reason if event.stop_response else None
+        if stop not in ("end_turn", "tool_use"):  # unusual end (max_tokens, error): keep a short excerpt for diagnosis
+            parts = (event.stop_response.message.get("content", []) if event.stop_response else [])
+            excerpt = json.dumps([p.get("text") or p.get("toolUse") or "" for p in parts], ensure_ascii=False)[:400]
+            log(event="model_call", ms=ms, stop=stop, error=repr(event.exception)[:300] if event.exception else None,
+                excerpt=excerpt)
 
     def before_tool(event: BeforeToolCallEvent):
+        timing[event.tool_use.get("toolUseId")] = time.time()  # tools may run concurrently: per call
         if state["model_calls"] > MAX_TURNS:
             event.cancel_tool = TOOL_LIMIT_MESSAGE
 
     def after_tool(event: AfterToolCallEvent):
+        timing["tool_ms"] += int((time.time() - timing.pop(event.tool_use.get("toolUseId"), time.time())) * 1000)
         name = event.tool_use.get("name", "")
         result = event.result or {}
         text = _text(result)
@@ -418,8 +460,9 @@ def run_agent(payload, cancel_signal=None):
         log(event="tool_call", tool=name, ok=ok, chars=len(text), rows=len(rows) if rows else 0)
 
     cfg = llm_config()
-    params = {"temperature": cfg["temperature"]} if cfg["temperature"] is not None else None
-    model = OpenAIModel(client_args={"base_url": cfg["base_url"], "api_key": cfg["api_key"], "timeout": cfg["timeout"]},
+    params = {**({"temperature": cfg["temperature"]} if cfg["temperature"] is not None else {}), **cfg["params"]} or None
+    model = OpenAIModel(client_args={"base_url": cfg["base_url"], "api_key": cfg["api_key"], "timeout": cfg["timeout"],
+                                     "max_retries": cfg["max_retries"]},
                         model_id=cfg["model"], params=params)
     with MCPClient(url=GATEWAY_URL, auth_provider=GatewaySigV4()) as mcp:
         gateway_tools = mcp.list_tools_sync()
@@ -438,8 +481,10 @@ def run_agent(payload, cancel_signal=None):
         system = (f"{SYSTEM_PROMPT}\n\n今天是 {today:%Y-%m-%d}（北京时间）。\n当前控件值：{json.dumps(controls, ensure_ascii=False)}\n"
                   f"分析结构：{json.dumps(summary, ensure_ascii=False, default=str)[:SUMMARY_LIMIT]}")
         agent = Agent(model=model, tools=tools, system_prompt=system, messages=clean_history(payload.get("history")),
-                      callback_handler=None)
+                      callback_handler=on_stream)
+        timing["setup_ms"] = int((time.time() - started) * 1000)
         agent.hooks.add_callback(BeforeModelCallEvent, before_model)
+        agent.hooks.add_callback(AfterModelCallEvent, after_model)
         agent.hooks.add_callback(BeforeToolCallEvent, before_tool)
         agent.hooks.add_callback(AfterToolCallEvent, after_tool)
         try:
@@ -452,7 +497,8 @@ def run_agent(payload, cancel_signal=None):
     answer = "".join(part.get("text", "") for part in result.message.get("content", []) if "text" in part).strip()
     elapsed = int((time.time() - started) * 1000)
     log(event="answered", user=user.get("sub"), analysis=analysis, steps=len(steps), charts=len(state["charts"]),
-        elapsed_ms=elapsed)
+        elapsed_ms=elapsed, model=cfg["model"], setup_ms=timing.get("setup_ms"), model_ms=timing["model_ms"],
+        tool_ms=timing["tool_ms"], usage=result.metrics.accumulated_usage)
     out = {"answer": answer, "steps": steps, "model": cfg["model"], "elapsed_ms": elapsed}
     if state["charts"]:
         out["charts"] = state["charts"]
@@ -509,6 +555,10 @@ class Job:
             log(event="job_cancelled", job=self.id, after_s=int(time.time() - self.started))
         except ConfigError as error:
             self._write("SET #s = :failed, #e = :e", {":failed": "FAILED", ":e": str(error)}, {"#e": "error"})
+        except MaxTokensReachedException as error:  # the "max_tokens" model param cut off a runaway generation
+            log(event="job_failed", job=self.id, error=repr(error)[:300])
+            self._write("SET #s = :failed, #e = :e", {":failed": "FAILED",
+                        ":e": "模型这次输出过长被截断（超过 max_tokens），请重试或把问题拆小。"}, {"#e": "error"})
         except Exception as error:  # noqa: BLE001 - report, never crash the server
             log(event="job_failed", job=self.id, error=repr(error)[:800])
             self._write("SET #s = :failed, #e = :e", {":failed": "FAILED", ":e": str(error)[:500]}, {"#e": "error"})

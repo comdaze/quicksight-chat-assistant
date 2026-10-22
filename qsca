@@ -40,7 +40,8 @@ PINS = {
 }
 SOURCES = {
     "agent": ["agent/main.py", "agent/charts.py", "agent/prompt.py", "agent/sandbox.py"],
-    "web": ["web/handler.py", "web/auth.py", "web/index.html", "web/vendor/echarts-6.1.0.min.js"],
+    "web": ["web/handler.py", "web/auth.py", "web/index.html", "web/vendor/echarts-6.1.0.min.js",
+            "web/vendor/marked-18.1.1.umd.js", "web/vendor/purify-3.4.17.min.js"],
     "tools-data": ["tools/data/handler.py", "tools/data/dataset.py", "tools/data/sqlcompile.py",
                    "tools/common/caller.py", "tools/common/definition.py"],
     "tools-analysis": ["tools/analysis/handler.py", "tools/common/caller.py", "tools/common/definition.py",
@@ -176,7 +177,14 @@ def cmd_model(args):
     api_key = getpass.getpass("API Key（输入不回显）：").strip()
     if not base_url.startswith("https://"):
         print("提醒：base_url 不是 https，模型请求和 API Key 将以明文传输。")
-    value = {"base_url": base_url, "model": model, "api_key": api_key, "temperature": args.temperature, "timeout": 120}
+    value = {"base_url": base_url, "model": model, "api_key": api_key, "temperature": args.temperature,
+             "timeout": args.timeout}
+    if args.temperature is None:
+        value.pop("temperature")  # some reasoning models reject a temperature
+    if args.params:
+        value["params"] = json.loads(args.params)
+        if not isinstance(value["params"], dict):
+            sys.exit("--params 必须是 JSON 对象，如 '{\"reasoning_effort\": \"medium\"}'")
     session(args, config).client("secretsmanager").put_secret_value(SecretId=name, SecretString=json.dumps(value))
     print(f"已更新 {name}。Runtime 最迟 60 秒后使用新模型。")
 
@@ -385,7 +393,9 @@ def main():
     model = sub.add_parser("model")
     model.add_argument("--base-url")
     model.add_argument("--model")
-    model.add_argument("--temperature", type=float, default=0.2)
+    model.add_argument("--temperature", type=float, default=None)
+    model.add_argument("--timeout", type=int, default=180)
+    model.add_argument("--params", help='extra Chat Completions fields as JSON, e.g. \'{"reasoning_effort": "medium"}\'')
     model.set_defaults(func=cmd_model)
     secret = sub.add_parser("datasource-secret")
     secret.add_argument("datasource", help="QuickSight data source id")

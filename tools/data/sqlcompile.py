@@ -93,6 +93,24 @@ def _escape_like(value):
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+INDEXED = re.compile(r"^values\s*\[\s*(\d)\s*\]$")
+
+
+def _list_value(flt):
+    """The list operand of in / not_in / between. Some models garble the key name ("values[]", "values 范围内",
+    "values[0]" + "values[1]"); accept those rather than burning a model round trip on a retry."""
+    if flt.get("values") is not None:
+        return flt["values"]
+    garbled = {k.strip(): v for k, v in flt.items() if isinstance(k, str) and k.strip().startswith("values")}
+    lists = [v for v in garbled.values() if isinstance(v, list)]
+    if lists:
+        return lists[0]
+    indexed = sorted((int(m.group(1)), v) for k, v in garbled.items() if (m := INDEXED.match(k)))
+    if indexed and [i for i, _ in indexed] == list(range(len(indexed))):
+        return [v for _, v in indexed]
+    return flt.get("value")
+
+
 def compile_query(spec, columns, source, dialect):
     """Return (sql, params, output_columns).
 
@@ -170,7 +188,7 @@ def compile_query(spec, columns, source, dialect):
         expression, info = column(flt.get("column"), "filters ")
         op, value = flt["op"], flt.get("value")
         if op in ("in", "not_in", "between"):
-            value = flt.get("values") if flt.get("values") is not None else value  # schema: "values" is the list form
+            value = _list_value(flt)  # schema: "values" is the list form
         elif isinstance(value, list) and len(value) == 1:
             value = value[0]
         is_time = info["type"] in ("DATETIME", "DATE")
@@ -179,13 +197,14 @@ def compile_query(spec, columns, source, dialect):
             continue
         if op in ("in", "not_in"):
             if not isinstance(value, list) or not 1 <= len(value) <= MAX_IN_VALUES:
-                raise QueryError(f"{op} 需要 1 到 {MAX_IN_VALUES} 个值的列表")
+                raise QueryError(f'{op} 需要 "values": [...]（键名正好是 values，1 到 {MAX_IN_VALUES} 个值）')
             placeholders = ", ".join(bind(v) for v in value)
             where.append(f"{expression} {'NOT ' if op == 'not_in' else ''}IN ({placeholders})")
             continue
         if op == "between":
             if not isinstance(value, list) or len(value) != 2:
-                raise QueryError("between 需要 [最小值, 最大值]")
+                raise QueryError('between 需要 "values": ["最小值", "最大值"]（键名正好是 values，两个元素）；'
+                                 '也可以改用一个 gte 加一个 lte 条件')
             low, high = value
             if is_time and isinstance(high, str) and DATE_ONLY.match(high):
                 where.append(f"{expression} >= {bind(low)} AND {expression} < {dialect.next_day(bind(high))}")
