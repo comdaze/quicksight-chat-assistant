@@ -156,7 +156,49 @@ def _references(definition, visual_id):
     return found
 
 
+def _fields(value):
+    """Every field-well entry body ({"FieldId", "Column", ...}) under a visual's FieldWells, keyed by its type."""
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            if key.endswith(("DimensionField", "MeasureField")) and isinstance(inner, dict) and "FieldId" in inner:
+                yield key, inner
+            else:
+                yield from _fields(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _fields(inner)
+
+
+def _sync_hierarchies(body):
+    """QuickSight requires every date dimension in a visual to point at a DateTimeHierarchy of that visual
+    ("Datetime field should have a datetime hierarchy"), and rejects hierarchies nobody uses. Edits replace fields,
+    so rebuild the links: keep used hierarchies, add one for each date field that has none."""
+    fields = list(_fields(body.get("ChartConfiguration", {}).get("FieldWells", {})))
+    hierarchies = body.get("ColumnHierarchies") or []
+    known = {next(iter(h.values())).get("HierarchyId") for h in hierarchies}
+    for key, field in fields:
+        if key == "DateDimensionField" and field.get("HierarchyId") not in known:
+            field["HierarchyId"] = field["FieldId"]
+            hierarchies.append({"DateTimeHierarchy": {"HierarchyId": field["FieldId"], "DrillDownFilters": []}})
+            known.add(field["FieldId"])
+    used = {f.get("HierarchyId") for _k, f in fields if f.get("HierarchyId")}
+    hierarchies = [h for h in hierarchies if next(iter(h.values())).get("HierarchyId") in used]
+    if hierarchies:
+        body["ColumnHierarchies"] = hierarchies
+    else:
+        body.pop("ColumnHierarchies", None)
+
+
 def apply_edit(definition, edit, columns):
+    """Apply one edit in place; returns (visual id or None, summary)."""
+    visual_id, summary = _apply_edit(definition, edit, columns)
+    if visual_id:
+        _s, _v, _kind, body = _find(definition, visual_id)
+        _sync_hierarchies(body)
+    return visual_id, summary
+
+
+def _apply_edit(definition, edit, columns):
     if not isinstance(edit, dict) or edit.get("operation") not in OPERATIONS:
         raise EditError(f"operation 只能是 {', '.join(OPERATIONS)}")
     op = edit["operation"]

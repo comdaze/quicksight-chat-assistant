@@ -194,6 +194,51 @@ def clean_history(history):
             if isinstance(t, dict) and t.get("role") in ("user", "assistant") and isinstance(t.get("content"), str)]
 
 
+def unbacked_claim(result, steps, state):
+    """Name of the tool the answer claims to have used but did not (successfully) call this turn, else None.
+    The chat page only shows a preview / Apply button for a real preview_analysis_change call."""
+    answer = "".join(part.get("text", "") for part in result.message.get("content", []) if "text" in part)
+    used = {s["tool"] for s in steps if s.get("ok")}
+    if "应用到分析" in answer and not any(c.get("pending_change") for c in state["charts"]):
+        return "preview_analysis_change"
+    if re.search(r"已(强制)?撤销|撤销成功|已(被)?还原|已恢复|撤销被阻止|无法撤销", answer) and "undo_last_visual_change" not in used:
+        return "undo_last_visual_change"
+    return None
+
+
+# Undo requests ("撤销", "强制撤销", "撤销上一步的修改", "帮我回退一下") are commands, not questions: run them in code.
+# Models tend to answer them from the conversation history (copying an earlier "已撤销" or "撤销被阻止") without
+# calling the tool. A short message that asks to undo, with no question, negation or other edit in it, counts.
+UNDO_WORDS = re.compile(r"撤销|撤回|回退|还原|恢复(到)?(之前|上一步|原来)")
+NOT_UNDO = re.compile(r"不要|别|不用|无需|吗|？|\?|什么|怎么|如何|能否|为什么|哪|改成|改为|换成|新增|添加|删除|画|标题|查询|统计")
+
+
+def undo_command(prompt):
+    """None, or {"force": bool} when the whole message is a request to undo the latest applied change."""
+    text = re.sub(r"\s+", "", prompt or "")
+    if not text or len(text) > 20 or not UNDO_WORDS.search(text) or NOT_UNDO.search(text):
+        return None
+    return {"force": "强制" in text}
+
+
+DASHBOARD_EDIT_MESSAGE = ("这里是已发布的仪表盘，在这里修改或撤销都不会让仪表盘变化。请到对应的分析里操作，"
+                          "改完后重新发布仪表盘。")
+DASHBOARD_PROMPT = ("当前页面是已发布的仪表盘，不是分析：仪表盘不会随分析的修改而变化，你也没有修改工具。用户要改图表、"
+                    "改标题、新增或删除图表、撤销时，直接告诉用户：" + DASHBOARD_EDIT_MESSAGE + "\n")
+
+
+def run_undo(mcp, injected, force):
+    step = {"tool": "undo_last_visual_change", "arguments": {"force": True} if force else {}, "ok": True}
+    try:
+        data = _call(mcp, f"{ANALYSIS_TARGET}___undo_last_visual_change", {**injected, **step["arguments"]})
+        answer = f"已撤销：{data.get('undid') or '最近一次修改'}。请手动刷新页面查看；仪表盘需要重新发布才会变化。"
+    except ValueError as error:
+        step["ok"] = False
+        answer = f"没有撤销：{error}"
+    log(event="undo_command", force=force, ok=step["ok"])
+    return answer, [step]
+
+
 def clean_parameters(parameters):
     if not isinstance(parameters, dict):
         return {}
@@ -397,6 +442,7 @@ def run_agent(payload, cancel_signal=None):
         raise ValueError("prompt must be a non-empty string of at most 2000 characters")
     started = time.time()
     analysis = str(payload.get("analysis") or "")
+    in_dashboard = payload.get("where") == "dashboard"
     parameters = clean_parameters(payload.get("parameters"))
     token = payload.get("auth") if isinstance(payload.get("auth"), str) else ""
     injected = {"_caller": token, "_analysis": analysis, "_parameters": parameters}
@@ -488,6 +534,13 @@ def run_agent(payload, cancel_signal=None):
                                      "max_retries": cfg["max_retries"]},
                         model_id=cfg["model"], params=params)
     with MCPClient(url=GATEWAY_URL, auth_provider=GatewaySigV4()) as mcp:
+        undo = undo_command(prompt)
+        if undo and analysis:
+            answer, steps = (DASHBOARD_EDIT_MESSAGE, []) if in_dashboard else run_undo(mcp, injected, force=undo["force"])
+            elapsed = int((time.time() - started) * 1000)
+            log(event="answered", user=user.get("sub"), analysis=analysis, steps=1, charts=0, elapsed_ms=elapsed,
+                model=None, setup_ms=elapsed, model_ms=[], tool_ms=elapsed, usage={})
+            return {"answer": answer, "steps": steps, "model": "（直接执行）", "elapsed_ms": elapsed}
         gateway_tools = mcp.list_tools_sync()
         try:
             summary = _call(mcp, f"{ANALYSIS_TARGET}___describe_analysis", injected) if analysis else \
@@ -495,13 +548,16 @@ def run_agent(payload, cancel_signal=None):
         except ValueError as error:
             summary = {"error": str(error)}
         replaced = {f"{ANALYSIS_TARGET}___preview_analysis_change"}
+        if in_dashboard:  # a published dashboard does not change when the analysis is edited: offer no edit tools
+            replaced |= {f"{ANALYSIS_TARGET}___undo_last_visual_change", f"{ANALYSIS_TARGET}___apply_pending_change"}
         tools = [WithCaller(t, injected) if t.tool_name.startswith(TRUSTED_TARGETS) else t
                  for t in gateway_tools if t.tool_name not in replaced]
-        tools += local_tools(mcp, injected, summary, state)
+        tools += [t for t in local_tools(mcp, injected, summary, state)
+                  if not (in_dashboard and t.tool_name == "preview_analysis_change")]
         controls = {name: {"control": (summary.get("parameters", {}).get(name) or {}).get("control"), "value": value}
                     for name, value in parameters.items()} if isinstance(summary, dict) else parameters
         today = dt.datetime.now(dt.timezone.utc).astimezone(dt.timezone(dt.timedelta(hours=8)))
-        system = (f"{SYSTEM_PROMPT}\n\n今天是 {today:%Y-%m-%d}（北京时间）。\n当前控件值：{json.dumps(controls, ensure_ascii=False)}\n"
+        system = (f"{SYSTEM_PROMPT}\n\n{DASHBOARD_PROMPT if in_dashboard else ''}今天是 {today:%Y-%m-%d}（北京时间）。\n当前控件值：{json.dumps(controls, ensure_ascii=False)}\n"
                   f"分析结构：{json.dumps(summary, ensure_ascii=False, default=str)[:SUMMARY_LIMIT]}")
         agent = Agent(model=model, tools=tools, system_prompt=system, messages=clean_history(payload.get("history")),
                       callback_handler=on_stream)
@@ -512,6 +568,17 @@ def run_agent(payload, cancel_signal=None):
         agent.hooks.add_callback(AfterToolCallEvent, after_tool)
         try:
             result = agent(prompt.strip(), cancel_signal=cancel_signal)
+            claim = None if in_dashboard else unbacked_claim(result, steps, state)
+            if claim and result.stop_reason != "cancelled":
+                # The model said it made a preview / undid a change without calling the tool (it copies earlier turns
+                # of the conversation). Without the tool call the user sees no preview and no Apply button.
+                log(event="unbacked_claim", tool=claim)
+                result = agent(f"你的回答说已经完成，但本轮没有调用 {claim}，用户什么也看不到。现在调用 {claim} 完成这个请求，"
+                               "然后重新简短回答。", cancel_signal=cancel_signal)
+                if result.stop_reason != "cancelled" and unbacked_claim(result, steps, state):
+                    log(event="unbacked_claim_again", tool=claim)
+                    result.message = {"role": "assistant", "content": [{"text": (
+                        "这次没有真正执行（模型没有调用相应工具），分析没有任何变化。请再发一次同样的请求。")}]}
         finally:
             if state.get("sandbox") is not None:
                 state["sandbox"].close()

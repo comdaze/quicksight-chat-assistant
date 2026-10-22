@@ -107,8 +107,12 @@ def analysis_permissions(aid):
         AwsAccountId=ACCOUNT, AnalysisId=aid).get("Permissions", []))
 
 
+SOURCE_TAG = "qsca:source-analysis"  # set by `qsca publish`, whose dashboards are built from a definition
+
+
 def dashboards_of(aid):
-    """Dashboards whose current version was published from this analysis."""
+    """Dashboards whose current version was published from this analysis (console publish: SourceEntityArn;
+    `qsca publish`: the SOURCE_TAG tag)."""
     def load():
         partition = "aws-cn" if QS_REGION.startswith("cn-") else "aws"
         arn = f"arn:{partition}:quicksight:{QS_REGION}:{ACCOUNT}:analysis/{aid}"
@@ -119,6 +123,13 @@ def dashboards_of(aid):
             except qs.exceptions.ResourceNotFoundException:
                 continue
             if version.get("SourceEntityArn") == arn:
+                found.append(summary["DashboardId"])
+                continue
+            try:
+                tags = qs.list_tags_for_resource(ResourceArn=summary["Arn"]).get("Tags", [])
+            except Exception:  # noqa: BLE001 - tags are an optional link
+                tags = []
+            if any(t["Key"] == SOURCE_TAG and t["Value"] == aid for t in tags):
                 found.append(summary["DashboardId"])
         return found
     return cached(f"dashboards:{aid}", load, 300)

@@ -168,8 +168,11 @@ def submit(event, user):
                         "runtimeSession": runtime_session, "expiresAt": now + JOB_TTL_SECONDS})
     # "auth" is the user's verified session token: the Runtime never shows it to the model and only attaches it to
     # this solution's own tools, which verify it and check the user's QuickSight permissions.
+    # "where": the page the chat is embedded in. The browser does not reveal the QuickSight page, so dashboards
+    # published with `qsca publish` carry where=dashboard in the chat URL; anything else counts as the analysis.
+    where = "dashboard" if body.get("where") == "dashboard" else "analysis"
     payload = {"job": {"jobId": job_id}, "prompt": prompt, "history": body.get("history") or [],
-               "analysis": analysis, "parameters": body.get("parameters") or {},
+               "analysis": analysis, "parameters": body.get("parameters") or {}, "where": where,
                "user": {"sub": user["sub"], "name": user.get("name")}, "auth": bearer(event)}
     try:
         response = agentcore.invoke_agent_runtime(
@@ -184,7 +187,7 @@ def submit(event, user):
                          ExpressionAttributeNames={"#s": "status", "#e": "error"},
                          ExpressionAttributeValues={":s": "FAILED", ":e": f"提交到 Runtime 失败: {str(error)[:300]}"})
         return respond(502, {"error": "runtime did not accept the job", "jobId": job_id})
-    print(json.dumps({"job": job_id, "user": user["sub"], "event": "submitted", "analysis": analysis,
+    print(json.dumps({"job": job_id, "user": user["sub"], "event": "submitted", "analysis": analysis, "where": where,
                       "runtimeVersion": RUNTIME_VERSION}, ensure_ascii=False))
     return respond(202, {"jobId": job_id, "sessionId": session_id, "status": "RUNNING"})
 
@@ -256,6 +259,8 @@ def handler(event, context):
     http = event.get("requestContext", {}).get("http", {})
     method, path = http.get("method", ""), event.get("rawPath", "/")
     if method == "GET" and path in ("/", "/index.html"):
+        query = event.get("queryStringParameters") or {}
+        print(json.dumps({"event": "page", "params": sorted(query), "where": query.get("where")}))
         return respond(200, INDEX_HTML, PAGE_HEADERS)
     if method == "GET" and path in STATIC:
         return respond(200, STATIC[path], STATIC_HEADERS)

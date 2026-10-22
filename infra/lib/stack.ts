@@ -5,6 +5,8 @@ import * as apigw from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigwIntegrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as eventTargets from 'aws-cdk-lib/aws-events-targets';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -88,7 +90,8 @@ export class ChatAssistantStack extends Stack {
       resources: [`${qs}:user/${config.quickSight.namespace}/*`],
     });
     const quicksightDashboards = new iam.PolicyStatement({
-      actions: ['quicksight:ListDashboards', 'quicksight:DescribeDashboard', 'quicksight:DescribeDashboardPermissions'],
+      actions: ['quicksight:ListDashboards', 'quicksight:DescribeDashboard', 'quicksight:DescribeDashboardPermissions',
+        'quicksight:ListTagsForResource'],
       resources: [`${qs}:dashboard/*`],
     });
 
@@ -279,6 +282,33 @@ export class ChatAssistantStack extends Stack {
     stage.defaultRouteSettings = { throttlingRateLimit: config.api.rateLimit, throttlingBurstLimit: config.api.burstLimit };
 
     const apiUrl = Fn.join('', ['https://', api.apiId, `.execute-api.${this.region}.${this.urlSuffix}`]);
+    // ---- Dashboard publisher: marks the chat in every newly published dashboard version (where=dashboard) ----
+    // Console publishes copy the analysis' chat URL, and the browser does not tell the chat which page it is on.
+    const publisherFn = new lambda.Function(this, 'DashboardPublisher', {
+      functionName: `${prefix}-dashboard-publisher`, runtime: lambda.Runtime.PYTHON_3_12, architecture: lambda.Architecture.ARM_64,
+      handler: 'publisher.handler', code: lambda.Code.fromAsset(path.join(BUILD, 'tools-analysis')),
+      timeout: Duration.minutes(5), memorySize: 256, logGroup: logGroup('DashboardPublisherLogs', `${prefix}-dashboard-publisher`),
+      environment: { ACCOUNT_ID: this.account, QS_REGION: this.region, CHAT_URL: apiUrl },
+      reservedConcurrentExecutions: 1,  // one publish at a time; EventBridge retries throttled events
+      description: 'After a dashboard is published, marks this solution\'s chat in it as running in a dashboard.',
+    });
+    publisherFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['quicksight:DescribeDashboard', 'quicksight:DescribeDashboardDefinition', 'quicksight:UpdateDashboard',
+        'quicksight:ListDashboardVersions',
+        'quicksight:UpdateDashboardPublishedVersion', 'quicksight:TagResource'],
+      resources: [`${qs}:dashboard/*`],
+    }));
+    publisherFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:PassDataSet'], resources: [`${qs}:dataset/*`] }));
+    new events.Rule(this, 'DashboardPublished', {
+      description: 'QuickSight dashboard created or updated (console publish or API)',
+      eventPattern: {
+        source: ['aws.quicksight'],
+        detailType: ['AWS API Call via CloudTrail', 'AWS Service Event via CloudTrail'],
+        detail: { eventSource: ['quicksight.amazonaws.com'], eventName: ['CreateDashboard', 'UpdateDashboard'] },
+      },
+      targets: [new eventTargets.LambdaFunction(publisherFn, { retryAttempts: 2 })],
+    });
+
     new CfnOutput(this, 'ChatUrl', { value: Fn.join('', [apiUrl, '/']), description: 'Base URL of the chat page (used by qsca attach)' });
     new CfnOutput(this, 'AcsUrl', { value: Fn.join('', [apiUrl, '/saml/acs']), description: 'Identity Center application ACS URL' });
     new CfnOutput(this, 'SamlEntityId', { value: config.identityCenter.samlEntityId, description: 'Identity Center application SAML audience' });

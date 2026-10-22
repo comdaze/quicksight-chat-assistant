@@ -58,6 +58,29 @@ class EditTest(unittest.TestCase):
         edits.apply_edit(d, {"operation": "set_color", "visual_id": "v1", "color": None}, COLUMNS)
         self.assertNotIn("Colors", wells)
 
+    def test_date_fields_keep_a_datetime_hierarchy(self):
+        # Regression: v-price's date axis used HierarchyId "d-day"; set_category replaced the field without one and
+        # QuickSight refused the update ("Datetime field should have a datetime hierarchy").
+        d = base()
+        _kind, body = visual(d, "v1")
+        wells = next(iter(body["ChartConfiguration"]["FieldWells"].values()))
+        wells["Category"] = [{"DateDimensionField": {"FieldId": "d-day", "HierarchyId": "d-day", "DateGranularity": "DAY",
+                                                     "Column": {"DataSetIdentifier": "trade", "ColumnName": "t"}}}]
+        body["ColumnHierarchies"] = [{"DateTimeHierarchy": {"HierarchyId": "d-day", "DrillDownFilters": []}}]
+        edits.apply_edit(d, {"operation": "set_category", "visual_id": "v1", "category": {"column": "t", "grain": "month"}}, COLUMNS)
+        _kind, body = visual(d, "v1")
+        field = next(iter(body["ChartConfiguration"]["FieldWells"].values()))["Category"][0]["DateDimensionField"]
+        self.assertEqual(field["DateGranularity"], "MONTH")
+        self.assertEqual([h["DateTimeHierarchy"]["HierarchyId"] for h in body["ColumnHierarchies"]], [field["HierarchyId"]])
+        # A non-date category drops the now unused hierarchy
+        edits.apply_edit(d, {"operation": "set_category", "visual_id": "v1", "category": {"column": "station"}}, COLUMNS)
+        self.assertNotIn("ColumnHierarchies", visual(d, "v1")[1])
+        # New visuals with a date axis get one too
+        vid, _ = edits.apply_edit(d, {"operation": "add_visual", "chart_type": "line", "measures": [{"column": "price", "agg": "avg"}],
+                                      "category": {"column": "t", "grain": "week"}}, COLUMNS)
+        body = visual(d, vid)[1]
+        self.assertEqual(len(body["ColumnHierarchies"]), 1)
+
     def test_add_and_delete_visual_updates_layout(self):
         d = base()
         vid, summary = edits.apply_edit(d, {"operation": "add_visual", "chart_type": "bar", "title": "各场站电量",

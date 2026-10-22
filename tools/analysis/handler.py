@@ -13,6 +13,7 @@ definition to S3.
 """
 
 import datetime as dt
+import hashlib
 import json
 import os
 import time
@@ -39,6 +40,29 @@ def _prefix(aid):
 def _analysis(aid):
     out = qs.describe_analysis_definition(AwsAccountId=caller.ACCOUNT, AnalysisId=aid)
     return out["Name"], out["Definition"]
+
+
+# View state the QuickSight editor saves on its own (e.g. a dragged chart scrollbar); not an edit worth protecting.
+VIEW_STATE_KEYS = {"ScrollbarOptions"}
+
+
+def _strip_view_state(value):
+    if isinstance(value, dict):
+        return {k: _strip_view_state(v) for k, v in value.items() if k not in VIEW_STATE_KEYS}
+    if isinstance(value, list):
+        return [_strip_view_state(v) for v in value]
+    return value
+
+
+def fingerprint(definition):
+    """Content hash of an analysis definition, ignoring editor view state, to tell real later edits from autosaves."""
+    text = json.dumps(_strip_view_state(definition), sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(text.encode()).hexdigest()[:32]
+
+
+def _tag_saved_state(key, updated, definition):
+    s3.put_object_tagging(Bucket=BUCKET, Key=key, Tagging={"TagSet": [
+        {"Key": "appliedAt", "Value": str(updated.timestamp())}, {"Key": "fingerprint", "Value": fingerprint(definition)}]})
 
 
 def _save(aid, name, definition):
@@ -130,7 +154,7 @@ def _apply(email, aid, edit):
                   Body=json.dumps({"Name": name, "Definition": original, "by": email, "visual_id": visual_id,
                                    "summary": summary, "edit": edit}, ensure_ascii=False).encode())
     updated = _save(aid, name, definition)
-    s3.put_object_tagging(Bucket=BUCKET, Key=key, Tagging={"TagSet": [{"Key": "appliedAt", "Value": str(updated.timestamp())}]})
+    _tag_saved_state(key, updated, _analysis(aid)[1])  # the definition as QuickSight stored it
     log(event="analysis_changed", by=email, analysis=aid, edit=edit.get("operation"), visual=visual_id, backup=key)
     return visual_id, summary
 
@@ -176,18 +200,25 @@ def undo_last_visual_change(args):
         raise ToolError("没有可以撤销的图表修改")
     key = keys[-1]
     tags = {t["Key"]: t["Value"] for t in s3.get_object_tagging(Bucket=BUCKET, Key=key)["TagSet"]}
-    current = qs.describe_analysis(AwsAccountId=caller.ACCOUNT, AnalysisId=aid)["Analysis"]["LastUpdatedTime"]
-    if tags.get("appliedAt") and abs(current.timestamp() - float(tags["appliedAt"])) > 1 and not args.get("force"):
-        raise ToolError("这次修改之后分析又被改过（可能是在编辑界面里手动改的）。撤销会把那些修改一起覆盖掉；"
-                        "确认要撤销时请明确说“强制撤销”。")
+    if not args.get("force"):
+        if tags.get("fingerprint"):
+            # Compare content, not LastUpdatedTime: an open editor re-saves the analysis (scroll position etc.).
+            _name, now = _analysis(aid)
+            if fingerprint(now) != tags["fingerprint"]:
+                raise ToolError("这次修改之后分析的内容又被改过（可能是在编辑界面里手动改的）。撤销会把那些修改一起覆盖掉；"
+                                "确认要撤销时请明确说“强制撤销”。")
+        else:  # backups made before fingerprints existed
+            current = qs.describe_analysis(AwsAccountId=caller.ACCOUNT, AnalysisId=aid)["Analysis"]["LastUpdatedTime"]
+            if tags.get("appliedAt") and abs(current.timestamp() - float(tags["appliedAt"])) > 1:
+                raise ToolError("这次修改之后分析又被保存过（可能是编辑界面自动保存或手动修改）。撤销会把之后的修改一起覆盖掉；"
+                                "确认要撤销时请明确说“强制撤销”。")
     saved = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
     restored_at = _save(aid, saved["Name"], saved["Definition"])
     s3.copy_object(Bucket=BUCKET, Key=key.replace("/active/", "/undone/"), CopySource={"Bucket": BUCKET, "Key": key},
                    ServerSideEncryption="AES256")
     s3.delete_object(Bucket=BUCKET, Key=key)
     if len(keys) > 1:  # the analysis is now as it was right after the previous change, which stays undoable
-        s3.put_object_tagging(Bucket=BUCKET, Key=keys[-2],
-                              Tagging={"TagSet": [{"Key": "appliedAt", "Value": str(restored_at.timestamp())}]})
+        _tag_saved_state(keys[-2], restored_at, _analysis(aid)[1])
     log(event="analysis_change_undone", by=email, analysis=aid, visual=saved.get("visual_id"), backup=key)
     return {"undone": True, "undid": saved.get("summary") or f"{saved.get('visual_id')} 的修改",
             "message": "已撤销，请手动刷新页面查看。"}

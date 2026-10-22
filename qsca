@@ -8,6 +8,7 @@
   ./qsca model                         set the OpenAI-compatible model (or edit the secret in the console)
   ./qsca datasource-secret DATASOURCE  store database credentials for a QuickSight data source
   ./qsca attach ANALYSIS [--apply]     print (or add to the analysis) the chat visual for an analysis
+  ./qsca publish ANALYSIS DASHBOARD    publish the analysis as a dashboard whose chat knows it is a dashboard
   ./qsca check [--analysis ID]         check configuration: model, Identity Center, data source credentials
   ./qsca smoke --analysis ID --email E ask one question end to end (needs the session key; admin only)
 
@@ -22,6 +23,7 @@ import hmac
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -44,7 +46,7 @@ SOURCES = {
             "web/vendor/marked-18.1.1.umd.js", "web/vendor/purify-3.4.17.min.js"],
     "tools-data": ["tools/data/handler.py", "tools/data/dataset.py", "tools/data/sqlcompile.py",
                    "tools/common/caller.py", "tools/common/definition.py"],
-    "tools-analysis": ["tools/analysis/handler.py", "tools/common/caller.py", "tools/common/definition.py",
+    "tools-analysis": ["tools/analysis/handler.py", "tools/analysis/publisher.py", "tools/common/caller.py", "tools/common/definition.py",
                        "tools/common/edits.py"],
 }
 RDS_CA = ["https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-north-1/cn-north-1-bundle.pem",
@@ -211,6 +213,61 @@ def chat_url(base, analysis_id, parameter_names, viewer):
         parts.append(f"viewer=<<${viewer}>>")
     parts += [f"p.{name}=<<${name}>>" for name in parameter_names if name != viewer]
     return base.rstrip("/") + "/?" + "&".join(parts)
+
+
+def cmd_publish(args):
+    """Publish an analysis as a dashboard whose chat knows it is in a dashboard (where=dashboard in its URL).
+
+    The QuickSight console copies the analysis' chat URL unchanged, so a dashboard published there cannot tell the
+    chat that edits will not show up. This builds the dashboard from the analysis definition instead, tags it with
+    its source analysis (used for viewer permissions) and publishes the new version."""
+    config = load_config(args)
+    s = session(args, config)
+    qs = s.client("quicksight")
+    account = s.client("sts").get_caller_identity()["Account"]
+    partition = "aws-cn" if config["region"].startswith("cn-") else "aws"
+    out = qs.describe_analysis_definition(AwsAccountId=account, AnalysisId=args.analysis)
+    definition, name = out["Definition"], args.name or out["Name"]
+    marked = 0
+    for sheet in definition.get("Sheets", []):
+        for visual in sheet.get("Visuals", []):
+            body = visual.get("CustomContentVisual") or {}
+            url = (body.get("ChartConfiguration") or {}).get("ContentUrl") or ""
+            if url.startswith(outputs(args, config)["ChatUrl"].rstrip("/")):
+                url = re.sub(r"[?&]where=[^&]*", "", url)
+                body["ChartConfiguration"]["ContentUrl"] = url + ("&" if "?" in url else "?") + "where=dashboard"
+                marked += 1
+    if not marked:
+        die(f"分析 {args.analysis} 里没有本方案的聊天窗口；先运行 attach --apply")
+    tags = [{"Key": "qsca:source-analysis", "Value": args.analysis}]
+    try:
+        current = qs.describe_dashboard_definition(AwsAccountId=account, DashboardId=args.dashboard)
+        options = current.get("DashboardPublishOptions") or {}
+        version = qs.update_dashboard(AwsAccountId=account, DashboardId=args.dashboard, Name=name, Definition=definition,
+                                      DashboardPublishOptions=options, VersionDescription=f"qsca publish {args.analysis}")
+        print(f"更新仪表盘 {args.dashboard}")
+    except qs.exceptions.ResourceNotFoundException:
+        # New dashboard: analysis editors become dashboard owners, everyone else with access a viewer.
+        viewer = ["quicksight:DescribeDashboard", "quicksight:ListDashboardVersions", "quicksight:QueryDashboard"]
+        owner = viewer + ["quicksight:UpdateDashboard", "quicksight:DeleteDashboard", "quicksight:UpdateDashboardPermissions",
+                          "quicksight:DescribeDashboardPermissions", "quicksight:UpdateDashboardPublishedVersion"]
+        permissions = [{"Principal": p["Principal"], "Actions": owner if "quicksight:UpdateAnalysis" in p["Actions"] else viewer}
+                       for p in qs.describe_analysis_permissions(AwsAccountId=account, AnalysisId=args.analysis)["Permissions"]]
+        version = qs.create_dashboard(AwsAccountId=account, DashboardId=args.dashboard, Name=name, Definition=definition,
+                                      Permissions=permissions, Tags=tags, VersionDescription=f"qsca publish {args.analysis}")
+        print(f"创建仪表盘 {args.dashboard}（权限沿用分析：{len(permissions)} 个主体）")
+    number = int(version["VersionArn"].rsplit("/", 1)[-1])
+    for _ in range(60):
+        status = qs.describe_dashboard(AwsAccountId=account, DashboardId=args.dashboard, VersionNumber=number)["Dashboard"]["Version"]
+        if not status["Status"].endswith("_IN_PROGRESS"):
+            break
+        time.sleep(2)
+    if not status["Status"].endswith("SUCCESSFUL"):
+        die(f"仪表盘版本 {number} 失败：{status['Status']} {status.get('Errors')}")
+    qs.update_dashboard_published_version(AwsAccountId=account, DashboardId=args.dashboard, VersionNumber=number)
+    arn = f"arn:{partition}:quicksight:{config['region']}:{account}:dashboard/{args.dashboard}"
+    qs.tag_resource(ResourceArn=arn, Tags=tags)
+    print(f"已发布第 {number} 版。仪表盘里的聊天窗口知道自己在仪表盘中（where=dashboard），不会提供修改图表的功能。")
 
 
 def cmd_attach(args):
@@ -407,6 +464,11 @@ def main():
     attach.add_argument("--replace", help="visual id to replace with the chat (keeps its place in the layout)")
     attach.add_argument("--viewer-parameter", default="pViewer", help="parameter holding the viewer email (optional)")
     attach.set_defaults(func=cmd_attach)
+    publish = sub.add_parser("publish", help="publish an analysis as a dashboard (the chat there knows it is a dashboard)")
+    publish.add_argument("analysis")
+    publish.add_argument("dashboard", help="dashboard id (updated if it exists, otherwise created)")
+    publish.add_argument("--name", help="dashboard name (default: the analysis name)")
+    publish.set_defaults(func=cmd_publish)
     check = sub.add_parser("check")
     check.add_argument("--analysis")
     check.set_defaults(func=cmd_check)
