@@ -103,6 +103,8 @@ export class ChatAssistantStack extends Stack {
     analysisFn.addToRolePolicy(quicksightPeople);
     analysisFn.addToRolePolicy(quicksightDashboards);
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:UpdateAnalysis'], resources: analysisResources }));
+    // Column names and types for validating conversational edits.
+    analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:DescribeDataSet'], resources: [`${qs}:dataset/*`] }));
     // UpdateAnalysis requires PassDataSet on every dataset the definition references.
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:PassDataSet'], resources: [`${qs}:dataset/*`] }));
     sessionKey.grantRead(analysisFn);
@@ -194,6 +196,12 @@ export class ChatAssistantStack extends Stack {
       mcpTarget.node.addDependency(gatewayRole); // the gateway lists the server's tools when the target is created
     }
 
+    // ---- Code Interpreter for analyze_result: no internet (SANDBOX), no execution role, only result rows go in ----
+    const codeInterpreter = new agentcore.CfnCodeInterpreterCustom(this, 'CodeInterpreter', {
+      name: `${prefix}_sandbox`, description: 'pandas calculations on chat query results (no network)',
+      networkConfiguration: { networkMode: 'SANDBOX' },
+    });
+
     // ---- AgentCore Runtime (Strands agent, Python 3.12 ZIP built by ./qsca build) ----
     const agentCode = new s3assets.Asset(this, 'AgentCode', { path: path.join(BUILD, 'agent.zip') });
     const runtimeRole = new iam.Role(this, 'RuntimeRole', {
@@ -203,6 +211,11 @@ export class ChatAssistantStack extends Stack {
     llm.grantRead(runtimeRole);
     runtimeRole.addToPolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:InvokeGateway'], resources: [gateway.attrGatewayArn] }));
     runtimeRole.addToPolicy(new iam.PolicyStatement({ actions: ['dynamodb:UpdateItem'], resources: [jobs.tableArn] }));
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['bedrock-agentcore:StartCodeInterpreterSession', 'bedrock-agentcore:InvokeCodeInterpreter',
+        'bedrock-agentcore:StopCodeInterpreterSession', 'bedrock-agentcore:GetCodeInterpreterSession'],
+      resources: [codeInterpreter.attrCodeInterpreterArn],
+    }));
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams', 'logs:DescribeLogGroups',
         'xray:PutTraceSegments', 'xray:PutTelemetryRecords', 'cloudwatch:PutMetricData'],
@@ -220,6 +233,7 @@ export class ChatAssistantStack extends Stack {
       lifecycleConfiguration: { idleRuntimeSessionTimeout: config.runtime.idleSeconds, maxLifetime: config.runtime.maxLifetimeSeconds },
       environmentVariables: {
         GATEWAY_URL: gateway.attrGatewayUrl, LLM_SECRET_ID: llm.secretName, JOBS_TABLE: jobs.tableName, APP_REGION: this.region,
+        CODE_INTERPRETER_ID: codeInterpreter.attrCodeInterpreterId,
       },
     });
     runtime.node.addDependency(runtimeRole);

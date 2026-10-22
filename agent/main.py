@@ -14,7 +14,8 @@ Model: OpenAI-compatible endpoint from the Secrets Manager secret LLM_SECRET_ID 
 Tools: everything on the AgentCore Gateway. Calls to this solution's own targets (TRUSTED_TARGETS) carry the user's
 signed session token, the analysis id and the current control values, added here in code (WithCaller) - the model
 neither sees nor sets them. Other targets (an enterprise MCP such as DataHub or Metabase) get nothing extra.
-Local tools: plot_result, preview_visual_change, suggest_controls. Chart numbers always come from tool results.
+Local tools: plot_result, preview_analysis_change, analyze_result (pandas in a no-network Code Interpreter
+sandbox), suggest_controls. Chart numbers always come from tool results.
 """
 
 import copy
@@ -39,6 +40,7 @@ from strands.tools.mcp import MCPClient
 from strands.types.tools import AgentTool
 
 import charts
+import sandbox
 from prompt import SYSTEM_PROMPT
 
 REGION = os.environ.get("APP_REGION") or os.environ.get("AWS_REGION")
@@ -223,51 +225,111 @@ def local_tools(mcp, injected, summary, state):
                            "notes": notes}, ensure_ascii=False)
 
     @tool
-    def preview_visual_change(visual_id: str, chart_type: str) -> str:
-        """Prepare (do not apply) switching one visual of the analysis between line chart and bar chart. The chat
-        panel shows a preview with the visual's data under the current controls, plus an 应用到分析 button; the analysis
-        changes only when the user presses it. Never say it is changed.
+    def preview_analysis_change(operation: str, visual_id: str = "", chart_type: str = "", title: str = "",
+                                measures: list[dict] | None = None, category: dict | None = None,
+                                color: dict | None = None, remove_color: bool = False, sort: dict | None = None,
+                                dataset: str = "", sheet_id: str = "") -> str:
+        """Prepare (do not apply) ONE edit of the QuickSight analysis. The chat panel shows a preview drawn with the
+        edited visual's data under the current controls, plus an 应用到分析 button; the analysis changes only when the
+        user presses it. Never say it is changed. For several edits, call this once per edit.
 
         Args:
-            visual_id: visual_id from the analysis summary.
-            chart_type: bar (柱状图) or line (折线图).
+            operation: change_chart_type (line/bar/table), set_title, set_measures (replace values), set_category
+                (x axis or first table group-by), set_color (split series; remove_color=true removes it), sort,
+                add_visual (new line/bar/table chart), delete_visual.
+            visual_id: Visual to edit, from the analysis summary (not needed for add_visual).
+            chart_type: line, bar or table (change_chart_type, add_visual).
+            title: New title (set_title, add_visual).
+            measures: [{"column": "...", "agg": "sum|avg|min|max|count|count_distinct"}] (set_measures, add_visual);
+                columns must be listed in the summary's columns for that dataset.
+            category: {"column": "...", "grain": "day|week|month|quarter|year|hour"} - grain only for date columns
+                (set_category, add_visual).
+            color: {"column": "..."} (set_color, add_visual).
+            remove_color: true with set_color to remove the split.
+            sort: {"by": "category|measure", "direction": "asc|desc"} (sort).
+            dataset: Dataset identifier (a key of the summary's datasets) for add_visual; default the first.
+            sheet_id: Sheet for add_visual; default the first sheet.
         """
+        edit = {k: v for k, v in {"operation": operation, "visual_id": visual_id, "chart_type": chart_type,
+                                   "title": title, "measures": measures, "category": category, "color": color,
+                                   "sort": sort, "dataset": dataset, "sheet_id": sheet_id}.items() if v not in (None, "", [])}
+        if remove_color:
+            edit["color"] = None
         try:
-            change = _call(mcp, f"{ANALYSIS_TARGET}___preview_visual_change",
-                           {"visual_id": visual_id, "chart_type": chart_type, **injected})
+            change = _call(mcp, f"{ANALYSIS_TARGET}___preview_analysis_change", {**edit, **injected})
         except ValueError as error:
             return json.dumps({"preview_ready": False, "error": str(error)}, ensure_ascii=False)
-        kind = "bar" if change["to"] == "BarChartVisual" else "line"
-        to_name = "柱状图" if kind == "bar" else "折线图"
-        title = change.get("title") or visual_id
+        summary_text = change.get("summary", operation)
         for name, value in injected["_parameters"].items():
-            title = title.replace(f"<<${name}>>", str(value))
-        pending = {"id": change["pending_change_id"], "expires_at": change["expires_at"], "visual_id": visual_id,
-                   "title": title, "to": to_name}
+            summary_text = summary_text.replace(f"<<${name}>>", str(value))
+        title_text = change.get("title") or ""
+        for name, value in injected["_parameters"].items():
+            title_text = title_text.replace(f"<<${name}>>", str(value))
+        pending = {"id": change["pending_change_id"], "expires_at": change["expires_at"], "summary": summary_text}
         preview, notes = change.get("preview") or {}, []
-        labels, series = [], []
+        kind = {"BarChartVisual": "bar", "LineChartVisual": "line", "TableVisual": "table"}.get(change.get("kind"), "none")
+        labels, series, columns_out, rows_out = [], [], [], []
         if "query" in preview and preview["query"].get("dataset_id"):
-            query = preview["query"]
             notes += preview.get("notes", [])
             try:
-                data = _call(mcp, f"{DATA_TARGET}___query_dataset", {**query, **injected})
+                data = _call(mcp, f"{DATA_TARGET}___query_dataset", {**preview["query"], **injected})
                 rows, columns = data.get("rows", []), data.get("columns", [])
-                x = next((c["name"] for c in columns if c["role"] in ("time", "dimension")), None)
-                metrics = [c["name"] for c in columns if c["role"] == "metric"]
-                dims = [c["name"] for c in columns if c["role"] == "dimension" and c["name"] != x]
-                labels, series, more = charts.from_rows(rows, x, metrics, dims[0] if dims else None)
-                notes += more
+                if kind == "table":
+                    columns_out = [c["name"] for c in columns]
+                    rows_out = [[r.get(c) for c in columns_out] for r in rows[:50]]
+                else:
+                    x = next((c["name"] for c in columns if c["role"] in ("time", "dimension")), None)
+                    metrics = [c["name"] for c in columns if c["role"] == "metric"]
+                    dims = [c["name"] for c in columns if c["role"] == "dimension" and c["name"] != x]
+                    labels, series, more = charts.from_rows(rows, x, metrics, dims[0] if dims else None)
+                    notes += more
                 if data.get("truncated"):
                     notes.append("数据超过 500 行，预览不完整")
             except ValueError as error:
                 notes.append(f"无法取数画预览：{error}")
-        else:
+        elif change.get("visual_id"):
             notes.append(f"无法画预览：{preview.get('unsupported', '这个图表的数据口径无法在聊天里复现')}。仍可直接应用。")
-        add_chart(charts.chart(kind if series else "none", f"预览：{title}（{to_name}）", labels, series, notes,
-                               pending_change=pending))
-        return json.dumps({"preview_ready": True, "visual": title, "to": to_name, "points": len(labels), "notes": notes,
+        drawable = (kind == "table" and columns_out) or (kind in ("line", "bar") and series)
+        spec = charts.chart(kind if drawable else "none", f"预览：{title_text or summary_text}", labels, series, notes,
+                            pending_change=pending)
+        if kind == "table" and columns_out:
+            spec.update(columns=columns_out, rows=rows_out)
+        add_chart(spec)
+        return json.dumps({"preview_ready": True, "change": summary_text, "notes": notes,
                            "message": "预览已显示在回答下方；分析尚未修改，用户点“应用到分析”后才会修改。"},
                           ensure_ascii=False)
+
+    @tool
+    def analyze_result(result_ids: list[str], code: str) -> str:
+        """Run Python (pandas/numpy) on earlier result rows in an isolated sandbox, for calculations aggregation
+        queries cannot do: period-over-period change, share of total, rank, moving average, correlation, outliers,
+        pivots, joining two results. Each result is a DataFrame named after its id (e.g. r1, r2). Assign the output
+        table to a DataFrame called `result` (it gets a new result_id for plot_result) and print short findings.
+        The sandbox has no network and no data other than these results.
+
+        Args:
+            result_ids: result_id values printed after earlier tool results, e.g. ["r1"].
+            code: Python code. Example: result = r1.assign(mom=r1["price"].pct_change()*100)
+        """
+        frames = {rid: state["results"][rid] for rid in result_ids if rid in state["results"]}
+        missing = [rid for rid in result_ids if rid not in state["results"]]
+        if missing or not frames:
+            return json.dumps({"ok": False, "error": f"没有结果 {missing or result_ids}；可用：{', '.join(state['results'])}"},
+                              ensure_ascii=False)
+        if state.get("sandbox") is None:
+            state["sandbox"] = sandbox.Sandbox(REGION)
+        try:
+            ran = state["sandbox"].run(frames, code)
+        except Exception as error:  # noqa: BLE001 - report sandbox problems to the model
+            return json.dumps({"ok": False, "error": str(error)[:500]}, ensure_ascii=False)
+        out = {"ok": ran["ok"], "stdout": ran["stdout"], "stderr": ran["stderr"]}
+        if ran["rows"]:
+            result_id = f"r{len(state['results']) + 1}"
+            state["results"][result_id] = ran["rows"]
+            out.update(result_id=result_id, row_count=len(ran["rows"]), columns=list(ran["rows"][0]),
+                       preview=ran["rows"][:20])
+        log(event="analyze_result", ok=ran["ok"], inputs=list(frames), rows=len(ran["rows"] or []))
+        return json.dumps(out, ensure_ascii=False, default=str)
 
     @tool
     def suggest_controls(values: dict[str, str]) -> str:
@@ -307,7 +369,7 @@ def local_tools(mcp, injected, summary, state):
             state["controls"] = out
         return json.dumps({"controls": out, "problems": problems}, ensure_ascii=False)
 
-    return [plot_result, preview_visual_change, suggest_controls]
+    return [plot_result, preview_analysis_change, analyze_result, suggest_controls]
 
 
 def run_agent(payload, cancel_signal=None):
@@ -340,7 +402,8 @@ def run_agent(payload, cancel_signal=None):
             parsed = None
         if isinstance(parsed, dict) and "error" in parsed:
             ok = False
-        rows = charts.find_rows(parsed) if ok and parsed is not None else None
+        local = "___" not in name  # local tools register their own result ids
+        rows = charts.find_rows(parsed) if ok and parsed is not None and not local else None
         content = text if len(text) <= TOOL_RESULT_LIMIT else text[:TOOL_RESULT_LIMIT] + "…（已截断）"
         if rows:
             result_id = f"r{len(state['results']) + 1}"
@@ -365,7 +428,7 @@ def run_agent(payload, cancel_signal=None):
                 {"error": "聊天窗口没有绑定分析"}
         except ValueError as error:
             summary = {"error": str(error)}
-        replaced = {f"{ANALYSIS_TARGET}___preview_visual_change"}
+        replaced = {f"{ANALYSIS_TARGET}___preview_analysis_change"}
         tools = [WithCaller(t, injected) if t.tool_name.startswith(TRUSTED_TARGETS) else t
                  for t in gateway_tools if t.tool_name not in replaced]
         tools += local_tools(mcp, injected, summary, state)
@@ -379,7 +442,11 @@ def run_agent(payload, cancel_signal=None):
         agent.hooks.add_callback(BeforeModelCallEvent, before_model)
         agent.hooks.add_callback(BeforeToolCallEvent, before_tool)
         agent.hooks.add_callback(AfterToolCallEvent, after_tool)
-        result = agent(prompt.strip(), cancel_signal=cancel_signal)
+        try:
+            result = agent(prompt.strip(), cancel_signal=cancel_signal)
+        finally:
+            if state.get("sandbox") is not None:
+                state["sandbox"].close()
     if result.stop_reason == "cancelled":
         raise Cancelled()
     answer = "".join(part.get("text", "") for part in result.message.get("content", []) if "text" in part).strip()

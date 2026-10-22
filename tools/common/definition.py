@@ -140,6 +140,11 @@ def _field(field):
     return out
 
 
+def _well_entries(body):
+    wells = next(iter(((body.get("ChartConfiguration") or {}).get("FieldWells") or {}).values()), {}) or {}
+    return [e for entries in wells.values() if isinstance(entries, list) for e in entries if isinstance(e, dict) and e]
+
+
 def visual_summary(kind, body, definition, full=False):
     """What a visual shows: title, dimensions, measures. Used by describe_analysis (expressions shortened for the
     model) and the preview (full=True: metric-switch fields need every branch)."""
@@ -163,7 +168,8 @@ def visual_summary(kind, body, definition, full=False):
             field["calculated"] = expression if full else expression[:300]
     return {"visual_id": body.get("VisualId"), "type": kind, "type_name": KIND_NAMES.get(kind, kind),
             "title": text(body.get("Title")), "dimensions": dims, "measures": measures, "colors": colors,
-            "can_switch_type": kind in CHART_KINDS.values()}
+            "can_switch_type": kind in CHART_KINDS.values(),
+            "editable": kind in ("LineChartVisual", "BarChartVisual", "TableVisual")}
 
 
 def convert(body, to_kind):
@@ -248,19 +254,26 @@ def preview_query(definition, visual_id, parameter_values):
     if len(datasets) != 1:
         return {"unsupported": "图表的字段来自多个数据集"}
     dataset = datasets.pop()
-    if len(summary["dimensions"]) != 1 or not summary["measures"]:
-        return {"unsupported": "只支持一个分类字段加若干数值字段的图表"}
+    is_table = found[0] == "TableVisual"
+    if not summary["dimensions"] or not summary["measures"] or (len(summary["dimensions"]) > (3 if is_table else 1)):
+        return {"unsupported": "只支持分类字段加若干数值字段的折线图、柱状图和表格"}
     if any(m.get("agg") is None for m in summary["measures"]):
         return {"unsupported": "图表用了聊天里不支持的聚合方式（如中位数、标准差）"}
-    dim = summary["dimensions"][0]
     query = {"dataset": dataset, "metrics": [{"column": m["column"], "agg": m["agg"]} for m in summary["measures"]],
              "dimensions": [], "filters": [], "limit": 500}
-    if dim["field"] == "DateDimensionField":
-        query["time"] = {"column": dim["column"], "grain": dim.get("grain", "day")}
-    else:
-        query["dimensions"].append(dim["column"])
-    if summary["colors"]:
-        query["dimensions"].append(summary["colors"][0]["column"])
+    for dim in summary["dimensions"] + summary["colors"][:1]:
+        if dim["field"] == "DateDimensionField" and "time" not in query:
+            query["time"] = {"column": dim["column"], "grain": dim.get("grain", "day")}
+        else:
+            query["dimensions"].append(dim["column"])
+    sort = (found[1].get("ChartConfiguration") or {}).get("SortConfiguration") or {}
+    field_sort = next((s["FieldSort"] for s in (sort.get("CategorySort") or sort.get("RowSort") or []) if "FieldSort" in s), None)
+    if field_sort:
+        names = {next(iter(e.values()))["FieldId"]: next(iter(e.values()))["Column"]["ColumnName"]
+                 for e in _well_entries(found[1])}
+        target = names.get(field_sort["FieldId"])
+        if target:  # output columns are named after their dataset column (see sqlcompile)
+            query["order_by"] = [{"name": target, "desc": field_sort.get("Direction") == "DESC"}]
     for binding in parameter_filters(definition):
         if binding["dataset"] != dataset or (binding["visuals"] != "all" and visual_id not in binding["visuals"]):
             continue

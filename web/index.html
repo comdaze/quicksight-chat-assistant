@@ -55,6 +55,10 @@
   .box button.primary{background:var(--brand);color:#fff}
   .box button.copy{font-size:11px;padding:0 6px;margin:0 0 0 4px;border-radius:4px}
   .box .note.err{color:var(--err)}
+  .ptable{max-height:260px;overflow:auto;margin-top:4px}
+  .ptable table{border-collapse:collapse;font-size:11px;width:100%}
+  .ptable th,.ptable td{border:1px solid var(--line);padding:2px 6px;text-align:left;white-space:nowrap}
+  .ptable th{background:var(--bg);position:sticky;top:0}
 </style>
 </head>
 <body>
@@ -269,26 +273,36 @@ function chartOption(spec) {
     series: spec.series.map((s) => ({ name: s.name, type: spec.type, data: s.data, showSymbol: !many, connectNulls: false, barMaxWidth: 18 })),
   };
 }
+function changeText(change) { return change.summary || `把“${change.title}”改为${change.to}`; }  // older history entries
 function previewHtml(change, status) {
   if (!change) return "";
-  if (status === "applied") return `<div class="box done"><p>✓ 已应用到分析：“${escapeHtml(change.title)}”改为${escapeHtml(change.to)}。请手动刷新页面查看。</p></div>`;
+  if (status === "applied") return `<div class="box done"><p>✓ 已应用到分析：${escapeHtml(changeText(change))}。请手动刷新页面查看。</p></div>`;
   if (status === "discarded") return `<div class="box off"><p>已放弃，分析未修改。</p></div>`;
   if (Date.now() / 1000 > change.expires_at) return `<div class="box off"><p>预览已过期，分析未修改。需要的话请重新提出修改。</p></div>`;
-  return `<div class="box" data-change="${escapeHtml(change.id)}"><p>这是把“${escapeHtml(change.title)}”改为${escapeHtml(change.to)}的预览，分析尚未修改。</p>
+  return `<div class="box" data-change="${escapeHtml(change.id)}"><p>预览：${escapeHtml(changeText(change))}。分析尚未修改。</p>
     <button type="button" class="primary apply-change">应用到分析</button><button type="button" class="discard-change">不用了</button></div>`;
 }
 function chartsHtml(list, turn) {
   return (list || []).map((spec, i) => {
     const notes = (spec.notes || []).map((n) => `<p class="note">${escapeHtml(n)}</p>`).join("");
     const status = spec.pending_change && turn.changes ? turn.changes[spec.pending_change.id] : undefined;
-    const chart = spec.type === "none" ? `<p class="head">${escapeHtml(spec.title)}</p>` : `<div class="chart" role="img" aria-label="${escapeHtml(spec.title)}"></div>`;
+    let chart;
+    if (spec.type === "table") {
+      const head = (spec.columns || []).map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+      const body = (spec.rows || []).map((r) => `<tr>${r.map((v) => `<td>${escapeHtml(v ?? "")}</td>`).join("")}</tr>`).join("");
+      chart = `<p class="head">${escapeHtml(spec.title)}</p><div class="ptable"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    } else if (spec.type === "none") {
+      chart = `<p class="head">${escapeHtml(spec.title)}</p>`;
+    } else {
+      chart = `<div class="chart" role="img" aria-label="${escapeHtml(spec.title)}"></div>`;
+    }
     return `<div class="chartbox" data-chart="${i}">${chart}${notes}${previewHtml(spec.pending_change, status)}</div>`;
   }).join("");
 }
 function mountCharts(container, list, turn) {
   if (!list || !list.length) return;
   container.classList.add("has-chart");
-  if (list.some((s) => s.type !== "none")) {
+  if (list.some((s) => s.type === "line" || s.type === "bar")) {
     loadECharts().then((ec) => {
       container.querySelectorAll(".chartbox").forEach((box) => {
         const node = box.querySelector(".chart");

@@ -39,11 +39,12 @@ PINS = {
     "tools-analysis": [],
 }
 SOURCES = {
-    "agent": ["agent/main.py", "agent/charts.py", "agent/prompt.py"],
+    "agent": ["agent/main.py", "agent/charts.py", "agent/prompt.py", "agent/sandbox.py"],
     "web": ["web/handler.py", "web/auth.py", "web/index.html", "web/vendor/echarts-6.1.0.min.js"],
     "tools-data": ["tools/data/handler.py", "tools/data/dataset.py", "tools/data/sqlcompile.py",
                    "tools/common/caller.py", "tools/common/definition.py"],
-    "tools-analysis": ["tools/analysis/handler.py", "tools/common/caller.py", "tools/common/definition.py"],
+    "tools-analysis": ["tools/analysis/handler.py", "tools/common/caller.py", "tools/common/definition.py",
+                       "tools/common/edits.py"],
 }
 RDS_CA = ["https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-north-1/cn-north-1-bundle.pem",
           "https://rds-truststore.s3.cn-north-1.amazonaws.com.cn/cn-northwest-1/cn-northwest-1-bundle.pem"]
@@ -146,7 +147,7 @@ def cmd_deploy(args):
     command = ["npx", "cdk", "deploy", "--context", f"config={pathlib.Path(args.config).resolve()}",
                "--require-approval", "never" if args.yes else "broadening", "--outputs-file", str(BUILD / "outputs.json")]
     subprocess.run(command, cwd=infra, check=True, env=env)
-    print("\n部署完成。下一步见 docs/部署手册.md 第 4 节（Identity Center、模型、数据源凭证、接入分析）。")
+    print("\n部署完成 / Deployed. Next: README, Deploy steps 3-7 (Identity Center, model, database credentials, attach).")
     cmd_outputs(args)
 
 

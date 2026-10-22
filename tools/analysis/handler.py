@@ -3,8 +3,9 @@
 Tools (the Runtime adds `_caller`, `_analysis` and `_parameters` - the current control values - to every call):
 - describe_analysis          sheets, visuals (what each one plots), parameters/controls, parameter-driven filters,
                              datasets. Anyone who may view the analysis or a dashboard published from it.
-- preview_visual_change      validate a line <-> bar switch and record a pending change (10 minutes) owned by the
-                             caller; returns the query that reproduces the visual's data for the preview chart.
+- preview_analysis_change    validate one edit (tools/common/edits.py: chart type, title, measures, category, color,
+                             sort, add or delete a visual) on a copy, record it as a pending change (10 minutes) owned
+                             by the caller, and return the query that reproduces the edited visual's data.
 - undo_last_visual_change    restore the definition saved before the latest applied change.
 - apply_pending_change       NOT a gateway tool: only the web Lambda calls it, when the user presses 应用到分析.
 Writes need quicksight:UpdateAnalysis for the caller on that analysis; every write first saves the previous
@@ -21,6 +22,7 @@ import boto3
 
 import caller
 import definition as defs
+import edits
 from caller import ToolError, log
 
 BUCKET = os.environ["BACKUP_BUCKET"]
@@ -52,62 +54,85 @@ def _save(aid, name, definition):
     return info["LastUpdatedTime"]
 
 
+def dataset_columns(definition):
+    """{dataset identifier: {column: QuickSight type}} including the analysis' calculated fields (type CALCULATED)."""
+    out = {}
+    for declaration in definition.get("DataSetIdentifierDeclarations", []):
+        dataset_id = declaration["DataSetArn"].rsplit("/", 1)[-1]
+        try:
+            description = caller.cached(f"ds:{dataset_id}", lambda d=dataset_id: qs.describe_data_set(
+                AwsAccountId=caller.ACCOUNT, DataSetId=d)["DataSet"])
+            out[declaration["Identifier"]] = {c["Name"]: c["Type"] for c in description.get("OutputColumns", [])}
+        except Exception as error:  # noqa: BLE001 - permissions on a dataset should not break the summary
+            log(event="describe_data_set_failed", dataset=dataset_id, error=repr(error)[:200])
+            out[declaration["Identifier"]] = {}
+    for field in definition.get("CalculatedFields", []):
+        out.setdefault(field.get("DataSetIdentifier"), {})[field["Name"]] = "CALCULATED"
+    return out
+
+
 def describe_analysis(args):
     _email, aid = caller.require_viewer(args)
     name, definition = _analysis(aid)
     summary = defs.strip_for_model(definition)
-    return {"analysis_id": aid, "name": name, **summary,
-            "note": "visual_id 用于 preview_visual_change；datasets 的值是 dataset_id，用于 query_dataset。"}
+    columns = {ds: dict(list(cols.items())[:150]) for ds, cols in dataset_columns(definition).items()}
+    return {"analysis_id": aid, "name": name, **summary, "columns": columns,
+            "note": "visual_id 用于 preview_analysis_change；datasets 的值是 dataset_id，用于 query_dataset；"
+                    "columns 按数据集标识列出可用于编辑图表的列和类型。"}
 
 
-def preview_visual_change(args):
+EDIT_KEYS = ("operation", "visual_id", "chart_type", "title", "measures", "category", "color", "sort", "dataset", "sheet_id")
+
+
+def preview_analysis_change(args):
     email, aid = caller.require_editor(args)
-    visual_id = str(args.get("visual_id") or "")
-    to = str(args.get("chart_type") or "").lower()
-    if to not in defs.CHART_KINDS:
-        raise ToolError("chart_type 只能是 bar（柱状图）或 line（折线图）")
-    to_kind = defs.CHART_KINDS[to]
+    edit = {k: args[k] for k in EDIT_KEYS if args.get(k) not in (None, "", [])}
+    if "color" in args and args.get("color") is None:
+        edit["color"] = None
     _name, definition = _analysis(aid)
-    found = next(((k, b) for _s, _v, k, b in defs.visuals(definition) if b["VisualId"] == visual_id), None)
-    if not found:
-        raise ToolError(f"分析里没有图表 {visual_id}；先调用 describe_analysis 查看可用的 visual_id")
-    try:  # dry run on a copy: same validation as the real change
-        defs.replace_chart_type(json.loads(json.dumps(definition, default=str)), visual_id, to_kind)
-    except ValueError as error:
+    columns = dataset_columns(definition)
+    draft = json.loads(json.dumps(definition, default=str))
+    try:
+        visual_id, summary = edits.apply_edit(draft, edit, columns)
+    except edits.EditError as error:
         raise ToolError(str(error)) from error
-    kind, body = found
     parameters = args.get("_parameters") if isinstance(args.get("_parameters"), dict) else {}
-    preview = defs.preview_query(definition, visual_id, parameters)
-    ids = defs.dataset_ids(definition)
+    preview = {"unsupported": "图表将被删除"} if visual_id is None else defs.preview_query(draft, visual_id, parameters)
+    title, kind = "", None
+    if visual_id is not None:
+        _s, _v, kind, body = next(x for x in defs.visuals(draft) if x[3].get("VisualId") == visual_id)
+        title = defs.text(body.get("Title")) or visual_id
+    ids = defs.dataset_ids(draft)
     if "query" in preview:
         preview["query"]["dataset_id"] = ids.get(preview["query"].pop("dataset"))
     change_id, now = uuid.uuid4().hex, int(time.time())
     jobs.put_item(Item={"jobId": f"pending#{change_id}", "status": "PENDING", "owner": email, "analysisId": aid,
-                        "visualId": visual_id, "toKind": to_kind, "fromKind": kind, "createdAt": now,
+                        "edit": json.dumps(edit, ensure_ascii=False), "summary": summary, "createdAt": now,
                         "expiresAt": now + PENDING_SECONDS})
-    log(event="visual_change_previewed", by=email, analysis=aid, visual=visual_id, old=kind, new=to_kind, change=change_id)
-    return {"pending_change_id": change_id, "expires_at": now + PENDING_SECONDS, "visual_id": visual_id,
-            "title": defs.text(body.get("Title")), "from": kind, "to": to_kind,
+    log(event="analysis_change_previewed", by=email, analysis=aid, edit=edit.get("operation"), change=change_id)
+    return {"pending_change_id": change_id, "expires_at": now + PENDING_SECONDS, "summary": summary,
+            "visual_id": visual_id, "title": title, "kind": kind,
             "preview": {k: v for k, v in preview.items() if k != "summary"},
             "message": "尚未修改分析。聊天框会显示预览，用户点“应用到分析”后才会修改。"}
 
 
-def _apply(email, aid, visual_id, to_kind):
+def _apply(email, aid, edit):
+    """Back up the current definition, then apply the edit to it (not to the preview's copy)."""
     name, definition = _analysis(aid)
     original = json.loads(json.dumps(definition, default=str))
     try:
-        old_kind = defs.replace_chart_type(definition, visual_id, to_kind)
-    except ValueError as error:
-        raise ToolError(str(error)) from error
+        visual_id, summary = edits.apply_edit(definition, edit, dataset_columns(definition))
+    except edits.EditError as error:
+        raise ToolError(f"分析在预览之后有变化，无法应用：{error}") from error
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     key = f"{_prefix(aid)}active/{stamp}.json"
     s3.put_object(Bucket=BUCKET, Key=key, ContentType="application/json", ServerSideEncryption="AES256",
                   Body=json.dumps({"Name": name, "Definition": original, "by": email, "visual_id": visual_id,
-                                   "from": old_kind, "to": to_kind}, ensure_ascii=False).encode())
+                                   "summary": summary, "edit": edit}, ensure_ascii=False).encode())
     updated = _save(aid, name, definition)
     s3.put_object_tagging(Bucket=BUCKET, Key=key, Tagging={"TagSet": [{"Key": "appliedAt", "Value": str(updated.timestamp())}]})
-    log(event="visual_changed", by=email, analysis=aid, visual=visual_id, old=old_kind, new=to_kind, backup=key)
-    return old_kind
+    log(event="analysis_changed", by=email, analysis=aid, edit=edit.get("operation"), visual=visual_id, backup=key)
+    return visual_id, summary
 
 
 def apply_pending_change(args):
@@ -132,14 +157,14 @@ def apply_pending_change(args):
             raise ToolError(f"这个修改已经处理过（{current.get('status')}）")
         raise ToolError("预览已过期，请重新让助手生成预览")
     try:
-        old_kind = _apply(email, aid, item["visualId"], item["toKind"])
+        visual_id, summary = _apply(email, aid, json.loads(item["edit"]))
     except Exception:
         jobs.update_item(Key=key, UpdateExpression="SET #s = :failed", ExpressionAttributeNames={"#s": "status"},
                          ExpressionAttributeValues={":failed": "FAILED"})
         raise
     jobs.update_item(Key=key, UpdateExpression="SET #s = :applied, appliedAt = :t", ExpressionAttributeNames={"#s": "status"},
                      ExpressionAttributeValues={":applied": "APPLIED", ":t": int(time.time())})
-    return {"changed": True, "visual_id": item["visualId"], "from": old_kind, "to": item["toKind"],
+    return {"changed": True, "visual_id": visual_id, "summary": summary,
             "message": "已修改，请手动刷新页面查看。只改了分析；仪表盘要重新发布才会变化。在聊天里说“撤销”可以恢复。"}
 
 
@@ -163,12 +188,12 @@ def undo_last_visual_change(args):
     if len(keys) > 1:  # the analysis is now as it was right after the previous change, which stays undoable
         s3.put_object_tagging(Bucket=BUCKET, Key=keys[-2],
                               Tagging={"TagSet": [{"Key": "appliedAt", "Value": str(restored_at.timestamp())}]})
-    log(event="visual_change_undone", by=email, analysis=aid, visual=saved.get("visual_id"), backup=key)
-    return {"undone": True, "visual_id": saved.get("visual_id"), "restored_type": saved.get("from"),
+    log(event="analysis_change_undone", by=email, analysis=aid, visual=saved.get("visual_id"), backup=key)
+    return {"undone": True, "undid": saved.get("summary") or f"{saved.get('visual_id')} 的修改",
             "message": "已撤销，请手动刷新页面查看。"}
 
 
-TOOLS = {"describe_analysis": describe_analysis, "preview_visual_change": preview_visual_change,
+TOOLS = {"describe_analysis": describe_analysis, "preview_analysis_change": preview_analysis_change,
          "apply_pending_change": apply_pending_change, "undo_last_visual_change": undo_last_visual_change}
 
 

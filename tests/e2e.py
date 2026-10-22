@@ -7,8 +7,9 @@
 --visual (a line or bar chart) enables the preview/apply/undo test; --dataset with --control-column (a column a
 control lists values from) enables the control-suggestion test. The chart question assumes nothing about the data.
 
-Checks: auth rejections; analysis summary; a data question answered with a chart; control suggestions; preview ->
-apply (owner only, once) -> undo, leaving the visual as it was; fast cancel; refusal for an unknown user.
+Checks: auth rejections; a data question answered with a chart; pandas calculations in the sandbox; control
+suggestions; preview -> apply (owner only, once) -> undo; add / retitle / delete a visual then undo all three; fast
+cancel; refusal for an unknown user. Edits are always undone, leaving the analysis as it was.
 """
 
 import argparse
@@ -61,6 +62,21 @@ class Client:
                 return result
         return {"status": "TIMEOUT"}
 
+    def definition(self):
+        qs = self.session.client("quicksight")
+        account = self.session.client("sts").get_caller_identity()["Account"]
+        return qs.describe_analysis_definition(AwsAccountId=account, AnalysisId=self.analysis)["Definition"]
+
+    def visuals(self):
+        """[(visual_id, type, title)] of the analysis."""
+        out = []
+        for sheet in self.definition().get("Sheets", []):
+            for visual in sheet.get("Visuals", []):
+                kind, body = next(iter(visual.items()))
+                title = ((body.get("Title") or {}).get("FormatText") or {}).get("PlainText", "")
+                out.append((body.get("VisualId"), kind, title))
+        return out
+
     def visual_type(self, visual_id):
         qs = self.session.client("quicksight")
         account = self.session.client("sts").get_caller_identity()["Account"]
@@ -110,6 +126,52 @@ def test_chat(c, args):
           [(ch["type"], ch["title"], len(ch["x"])) for ch in charts])
     check("token not leaked into the result", "_caller" not in json.dumps(r), "")
     print("     answer:", (r.get("answer") or "")[:160].replace("\n", " "))
+
+
+def test_analyze(c, args):
+    print("==> calculations in the code sandbox")
+    r = c.ask(c.token(args.editor), args.analyze_question)
+    used = tools(r)
+    check("job succeeded", r.get("status") == "SUCCEEDED", r.get("error") or r.get("status"))
+    check("ran analyze_result", ("analyze_result", True) in used, used)
+    check("chart drawn", bool(r.get("charts")), [(ch["type"], ch["title"], len(ch["x"])) for ch in r.get("charts") or []])
+    print("     answer:", (r.get("answer") or "")[:160].replace("\n", " "))
+
+
+def apply_preview(c, token, result, label):
+    previews = [ch for ch in result.get("charts") or [] if ch.get("pending_change")]
+    if not check(f"{label}: preview returned", bool(previews), tools(result)):
+        return None
+    status, body = qsca.http("POST", f"{c.base}/changes/{previews[0]['pending_change']['id']}/apply", token, {"analysis": c.analysis})
+    check(f"{label}: applied", status == 200 and body.get("changed"), body)
+    return body
+
+
+def test_edits(c, args):
+    print("==> add / retitle / delete a visual, then undo all three")
+    if not (args.dataset_identifier and args.category_column and args.measure_column):
+        print("   skipped (pass --dataset-identifier, --category-column and --measure-column)")
+        return
+    token, session = c.token(args.editor), f"qs-e2e-{uuid.uuid4().hex}"
+    original = c.visuals()
+    r = c.ask(token, f"在分析里新增一个柱状图：按 {args.category_column} 统计 {args.measure_column} 的总和，"
+                     f"标题叫“E2E 测试图表”，数据集用 {args.dataset_identifier}。先给我看预览。", session=session)
+    added = apply_preview(c, token, r, "add_visual")
+    if not added:
+        return
+    new_id = added.get("visual_id")
+    check("visual added", any(v[0] == new_id and v[2] == "E2E 测试图表" for v in c.visuals()), new_id)
+    r = c.ask(token, f"把 visual_id 为 {new_id} 的图表标题改成“E2E 改名”，先预览。", session=session)
+    apply_preview(c, token, r, "set_title")
+    check("title changed", any(v[0] == new_id and v[2] == "E2E 改名" for v in c.visuals()), "")
+    r = c.ask(token, f"删除 visual_id 为 {new_id} 的图表，先预览。", session=session)
+    apply_preview(c, token, r, "delete_visual")
+    check("visual deleted", all(v[0] != new_id for v in c.visuals()), "")
+    for i in range(3):
+        r = c.ask(token, "撤销", session=session)
+        check(f"undo {i + 1}", ("undo_last_visual_change", True) in tools(r), tools(r))
+    check("analysis back to the original visuals", c.visuals() == original,
+          [v for v in c.visuals() if v not in original] or "")
 
 
 def test_controls(c, args):
@@ -181,8 +243,8 @@ def test_refusal(c, args):
     check("no analysis access for unknown user", not any(ok for _t, ok in tools(r)), tools(r))
 
 
-TESTS = {"auth": test_auth, "chat": test_chat, "controls": test_controls, "preview": test_preview_apply_undo,
-         "cancel": test_cancel, "refusal": test_refusal}
+TESTS = {"auth": test_auth, "chat": test_chat, "analyze": test_analyze, "controls": test_controls,
+         "preview": test_preview_apply_undo, "edits": test_edits, "cancel": test_cancel, "refusal": test_refusal}
 
 
 def main():
@@ -196,6 +258,10 @@ def main():
     parser.add_argument("--dataset", help="dataset id for the control check")
     parser.add_argument("--control-column", help="column a control lists its values from")
     parser.add_argument("--chart-question", default="按月汇总这个分析里最主要的数值指标，并画出趋势图。")
+    parser.add_argument("--analyze-question", default="按月汇总这个分析里最主要的数值指标，再计算每月环比变化百分比，并画出环比图。")
+    parser.add_argument("--dataset-identifier", help="dataset identifier (key of the summary's datasets) for the edit test")
+    parser.add_argument("--category-column", help="a category column for the edit test")
+    parser.add_argument("--measure-column", help="a numeric column for the edit test")
     parser.add_argument("--only", action="append", choices=list(TESTS))
     args = parser.parse_args()
     client = Client(args)
