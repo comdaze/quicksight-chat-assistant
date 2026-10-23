@@ -26,7 +26,9 @@ cn-north-1).
 | Enterprise tools | Optional MCP servers (e.g. DataHub, Metabase via MCPHub) registered on the gateway |
 | Long and cancellable | Answers run as background jobs (HealthyBusy, up to the session lifetime); cancel stops within seconds |
 | Access control | Identity Center sign-in (the chat shows the user's name from the Identity Center directory); users only see analyses / dashboards they can view in QuickSight and only edit analyses they can edit there |
-| Example questions | A collapsed bar under the input box with one tab per capability; replaceable per deployment (`examples`) |
+| Example questions | A collapsed bar under the input box, one tab per group: the deployment default, or the analysis' own set kept by its editors in the chat |
+| Self-service setup | Anyone who can edit an analysis adds the chat by pasting `ChatUrl` into a custom visual and binding it in the chat |
+| Publish to dashboards | After **Apply**, **发布到仪表盘** publishes the analysis; dashboard chats (console or chat publish) offer no edits |
 
 ## Architecture
 
@@ -61,11 +63,11 @@ analysis tools Lambda directly as that user; the model can preview and undo edit
 |---|---|
 | `agent/` | Runtime agent (Strands): jobs, heartbeats, cancel, charts (`charts.py`), sandbox (`sandbox.py`), prompt |
 | `web/` | Web Lambda: chat page, SAML login, job API, apply endpoint; `web/vendor/` ECharts 6.1.0, marked 18.1.1, DOMPurify 3.4.17 (pinned copies with npm integrity, see `web/vendor/README.md`; no CDN) |
-| `tools/analysis/` | Gateway tools: describe the analysis, preview / apply / undo edits |
+| `tools/analysis/` | Gateway tools: describe the analysis, preview / apply / undo edits; button-only tools (publish, bind, example questions); `publisher.py` marks the chat in published dashboards |
 | `tools/data/` | Gateway tools: describe datasets, structured aggregate queries, distinct values |
 | `tools/common/` | Shared: caller verification and QuickSight permission checks, definition parsing, edit operations |
 | `infra/` | CDK (TypeScript) stack |
-| `qsca` | CLI: build, deploy, configure, attach, check, smoke test |
+| `qsca` | CLI: build, deploy, configure, attach, publish, check, smoke test |
 | `tests/` | Unit tests (`tests/unit`) and the deployed end-to-end suite (`tests/e2e.py`) |
 
 ## Deploy
@@ -374,92 +376,339 @@ cryptography 50.0.2, pg8000 1.31.5, PyMySQL 1.1.2, aws-cdk-lib 2.274.0, ECharts 
 
 # QuickSight 分析助手
 
-给 **任意 QuickSight 分析或仪表盘** 加一个聊天窗口。用户不离开 QuickSight，用中文提问；助手按当前控件查询分析背后的数据、
-做计算、在聊天里画图、提示要在控件里选什么值，还能用对话修改分析（先预览，用户点“应用”才生效，可撤销）。基于 Amazon
-Bedrock **AgentCore Runtime、Gateway、Code Interpreter** 与 **Strands Agents**，模型使用客户自己的 **OpenAI 兼容端点**
-（如 Amazon Bedrock，或 LiteLLM 等网关），随时可换，无需重新部署。
-已在 AWS 中国区北京（cn-north-1）验证。
+给 **任意 Amazon QuickSight 分析或仪表盘** 加一个聊天窗口。用户不离开 QuickSight，用自然语言提问；助手按当前控件值查询分析
+背后的数据、做计算、画图、提示要在控件里选什么值，还能用对话修改分析（先预览，用户确认后才生效，可撤销）。基于 Amazon Bedrock
+**AgentCore Runtime、Gateway、Code Interpreter** 与 **Strands Agents**；模型是你提供的任意 **OpenAI 兼容端点**（如 Amazon
+Bedrock，或 LiteLLM 等网关），随时可以切换，无需重新部署。已在 AWS 中国区北京（cn-north-1）验证。
 
 ## 功能
 
-| 能力 | 说明 |
+| 能力 | 实现方式 |
 |---|---|
-| 数据问答 | 读取分析结构（工作表、图表、参数、参数驱动的筛选、数据集和列），按当前控件值对数据集做只读聚合查询 |
-| 聊天出图 | 回答按 Markdown 显示（标题、列表、表格），附带 ECharts 折线图 / 柱状图；图里的数字由代码从工具结果读取，不由模型编写 |
-| 计算 | `analyze_result` 在 **无网络** 的 Code Interpreter 沙箱里用 pandas 处理查询结果（环比、同比、占比、排名、移动平均、相关性、异常值、合并结果） |
-| 控件提示 | 列出要在上方控件中选择的值（QuickSight 不允许嵌入的 iframe 修改控件） |
-| 对话式修改分析 | 改图表类型（折线 / 柱状 / 表格）、标题、指标与聚合、分类字段与时间粒度、颜色分组、排序，新增或删除图表。每次修改先 **预览**，用户点 **应用到分析** 才写入；可 **撤销** |
-| 企业工具 | 可选接入企业 MCP（如经 MCPHub 的 DataHub、Metabase） |
-| 长任务与取消 | 后台任务运行，最长到会话生命周期；取消通常几秒内生效 |
-| 权限 | Identity Center 登录（聊天窗口显示 Identity Center 目录中的姓名）；只能查看 QuickSight 中有权查看的分析/仪表盘，只能修改有编辑权限的分析 |
-| 示例问题 | 输入框下方的折叠栏，按能力分标签；每个部署可用 `examples` 替换 |
+| 数据问答 | 读取分析结构（工作表、图表、参数、参数驱动的筛选、数据集、列），按当前控件值对数据集做只读聚合查询 |
+| 聊天出图 | 回答按 Markdown 显示（标题、列表、表格），并附带 ECharts 折线图 / 柱状图；图里的每个数字都由代码从工具结果中读取，不由模型编写 |
+| 计算 | `analyze_result` 在 **无网络** 的 AgentCore Code Interpreter 中用 pandas 处理查询结果（环比、占比、排名、移动平均、相关性、异常值、合并结果） |
+| 控件提示 | 列出要在仪表盘控件里选择的值（QuickSight 不允许嵌入的 iframe 修改控件） |
+| 对话式修改分析 | 改图表类型（折线 / 柱状 / 表格）、标题、指标与聚合、分类字段与时间粒度、颜色分组、排序，新增或删除图表。每次修改先给出 **预览**，只有用户点 **应用到分析** 才会修改分析；**撤销** 恢复保存的定义 |
+| 企业工具 | 可选：在 Gateway 上注册 MCP 服务器（如经 MCPHub 的 DataHub、Metabase） |
+| 长任务与取消 | 回答作为后台任务运行（HealthyBusy，最长到会话生命周期）；取消几秒内生效 |
+| 权限 | Identity Center 登录（聊天窗口显示 Identity Center 目录中的用户姓名）；用户只能看到在 QuickSight 里有权查看的分析 / 仪表盘，只能修改在 QuickSight 里有权编辑的分析 |
+| 示例问题 | 输入框下方的折叠栏，每组一个标签：部署级默认，或分析编辑者在聊天里维护的分析专属示例 |
+| 自助接入 | 有分析编辑权限的人，把 `ChatUrl` 填进自定义可视内容，在聊天里绑定即可加上聊天窗口 |
+| 发布到仪表盘 | 点 **应用到分析** 后，**发布到仪表盘** 发布分析；仪表盘里的聊天（控制台发布或聊天发布）不提供修改 |
 
 ## 架构
 
-架构图见英文部分 [Architecture](#architecture)。要点：一个 CDK 栈部署在 QuickSight 所在区域；聊天页经 API Gateway 提交任务，
-AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具、数据工具、企业 MCP），计算放在无网络的 Code Interpreter 里；
-“应用到分析”按钮由 Web Lambda 以用户身份直接调用分析工具，模型只能预览和撤销，不能应用。
+```
+QuickSight 分析 / 仪表盘
+  └ 自定义可视内容（iframe）：聊天页
+       │ HTTPS + 会话令牌（IAM Identity Center SAML 登录后）
+       ▼
+API Gateway HTTP API ─▶ Web Lambda ───────────────────────────▶ DynamoDB（任务、登录状态、待确认修改）
+                         │ │                                           ▲ 心跳 / 结果
+                         │ └─ 登录：Identity Center 用户目录（按邮箱读取用户姓名）
+                         │ 提交任务（立即返回）                        │
+                         ▼                                             │
+                  AgentCore Runtime：Strands Agent（每个会话一个 microVM）
+                         │  ├─ 本地工具：plot_result、preview_analysis_change、suggest_controls
+                         │  └─ analyze_result ─▶ AgentCore Code Interpreter（SANDBOX：无网络，只有结果行）
+                         │ MCP + SigV4
+                         ▼
+                  AgentCore Gateway
+                    ├ 分析工具 Lambda ─▶ QuickSight API（读取 / 修改分析、权限），S3（备份）
+                    ├ 数据工具 Lambda（VPC）─▶ 数据集背后的数据库（参数化的只读 SQL）
+                    └ 企业 MCP 服务器（可选）
+模型：你的 OpenAI 兼容端点，如 Bedrock bedrock-runtime /openai/v1（地址和 Key 存在 Secrets Manager）
+```
+
+所有资源在 QuickSight 所在区域的一个 CDK 栈里。“应用到分析”按钮调用 Web Lambda，由它以该用户身份直接调用分析工具 Lambda；
+模型可以预览和撤销修改，但永远不能应用修改。
+
+## 仓库结构
+
+| 路径 | 内容 |
+|---|---|
+| `agent/` | Runtime 上的 Agent（Strands）：任务、心跳、取消、图表（`charts.py`）、沙箱（`sandbox.py`）、提示词 |
+| `web/` | Web Lambda：聊天页、SAML 登录、任务 API、应用接口；`web/vendor/` 下是 ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17（固定版本，带 npm 完整性校验，见 `web/vendor/README.md`；不用 CDN） |
+| `tools/analysis/` | Gateway 工具：描述分析、预览 / 应用 / 撤销修改；仅由按钮触发的工具（发布、绑定、示例问题）；`publisher.py` 给已发布仪表盘里的聊天打标记 |
+| `tools/data/` | Gateway 工具：描述数据集、结构化聚合查询、去重取值 |
+| `tools/common/` | 公共代码：调用者校验与 QuickSight 权限检查、定义解析、修改操作 |
+| `infra/` | CDK（TypeScript）栈 |
+| `qsca` | 命令行：构建、部署、配置、接入、发布、检查、冒烟测试 |
+| `tests/` | 单元测试（`tests/unit`）和针对已部署环境的端到端测试（`tests/e2e.py`） |
 
 ## 部署
 
-1. **前提**：QuickSight 企业版且用 IAM Identity Center 登录（邮箱一致）；OpenAI 兼容模型端点（支持工具调用和流式输出，Runtime 能经公网 HTTPS 访问，如 Amazon Bedrock、各家兼容接口，其他协议可经 LiteLLM 转换）；部署机器有 Node.js 20+、Python 3.9+（pip、boto3），能访问 npm 与 PyPI；目标账号区域执行过一次 `cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>`。
-2. **配置**：`cp config.example.json config.json`，按英文部分的配置表填写（前缀、区域、SAML 受众、可选的 Identity Store 位置、数据工具 Lambda 的 VPC 子网、是否创建接口端点、数据源密钥前缀、企业 MCP；允许嵌入聊天页的 `frameAncestors`；可选 `examples` 自定义聊天页的示例问题，便于针对客户数据演示）。数据库在 VPC 内时，推荐直接使用 QuickSight VPC 连接所在的子网。
-3. **部署**：`./qsca --profile <p> deploy`，完成后 `./qsca --profile <p> outputs` 查看 `ChatUrl`、`AcsUrl`、`SamlEntityId`、`ModelSecretName`。
-4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`（聊天窗口显示的姓名在登录时按邮箱从 Identity Center 用户目录读取，中文名按"姓+名"显示；断言里的 `familyName`、`givenName` 属性优先；Identity Center 在其他账号或区域时配置 `identityCenter.identityStoreId` / `region`，查不到就显示邮箱）；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
-5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效，Secrets Manager 保留旧版本便于回退；或 `./qsca model`（可带 `--base-url`、`--model`、`--params`、`--timeout`，Key 输入不回显）。不接受 `temperature` 的模型去掉该字段。可选 `max_retries`（默认 4）在模型返回 429、5xx 或连接失败时重试，响应流中途的错误由 Agent 再重试最多 3 次；可选 `params` 给每个请求附加字段（如 `{"reasoning_effort":"medium"}`）。使用 Amazon Bedrock 时 `base_url` 填 `https://bedrock-runtime.<区域>.amazonaws.com/openai/v1`、`api_key` 填 Bedrock API Key（Kimi K3 的模型 ID 如 `global.moonshotai.kimi-k3`（全球路由）或 `us.moonshotai.kimi-k3`（仅美国区域），建议 `params` 为 `{"reasoning_effort":"medium","max_tokens":8192}`；实测 `us.` 比 `global.` 快 2 到 5 倍，`low` 在修改分析类请求上会卡死；无论推理档位和温度，约六分之一的回答会变成乱码，直到 `max_tokens` 才结束，所以必须设 `max_tokens`；偶发的 500 会自动重试；Bedrock 长期 API Key 会过期，模型报 `401 Authentication failed` 时换新 Key）。换模型后建议跑一遍 `tests/e2e.py`；中国区没有 Bedrock，从中国区调用会跨境访问海外区域，需确认数据合规。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
-6. **数据库凭证**：为分析用到的每个 QuickSight 数据源，在同一区域创建只读账号密钥 `<前缀><DataSourceId>`，内容 `{"username","password"}`（`./qsca datasource-secret <DataSourceId>`）；数据库安全组放行数据工具 Lambda。
-7. **接入分析**：自助方式，不用命令行：在分析编辑界面添加“自定义可视内容”（Custom visual content），网址填部署输出的 `ChatUrl`（不带任何参数），在聊天窗口里登录后，从列出的分析中点选它所在的分析（刚编辑过的排在最前）即可绑定，绑定会补上分析 ID 和全部参数，刷新编辑界面后可用；需要该分析的编辑权限；以后分析增删了参数，聊天窗口会提示“更新绑定”。命令行方式：`./qsca --profile <p> attach <分析ID> --apply`（只打印地址时去掉 `--apply`；`--replace <visual_id>` 可替换已有图表的位置），然后在 QuickSight 控制台照常发布仪表盘（或 `./qsca --profile <p> publish <分析ID> <仪表盘ID>`）：浏览器不会告诉聊天窗口自己在哪个页面，控制台发布又会原样复制分析里的聊天地址，所以每次发布后 EventBridge 会触发 `<前缀>-dashboard-publisher` Lambda，在新版本的聊天地址里加 `where=dashboard` 并发布（约 20 秒，之后刷新仪表盘）；仪表盘里的聊天就不提供修改（修改只作用于分析），并提示到分析里改；仪表盘还会打上来源分析的标签，只有仪表盘权限的用户仍可使用。可选：建参数 `pViewer`（动态默认值为当前用户邮箱），用于检测同一浏览器切换了 QuickSight 用户。
-8. **自检**：`./qsca --profile <p> check --analysis <分析ID>`；管理员可用 `smoke` 和 `tests/e2e.py` 做端到端测试。
-9. **企业 MCP**：在 `mcpTargets` 中配置（示例见英文部分），重新 `deploy`。端点须为公网 HTTPS（中国区 Gateway 不能访问 VPC 内地址），支持 MCP 协议 `2025-03-26`；这些服务收不到用户身份，只开放只读工具。
-10. **更新 / 回滚 / 卸载**：更新拉代码后 `deploy`（模型、元数据、凭证不会被覆盖）；回滚用上一个版本代码 `deploy`；卸载 `cd infra && AWS_PROFILE=<p> npx cdk destroy --context config=../config.json`，S3 备份桶、SSM 元数据参数、数据源密钥、分析中的聊天可视对象、Identity Center 应用需手动清理。
+### 前提
+
+| 项目 | 要求 |
+|---|---|
+| AWS | 账号和 QuickSight 所在区域（已验证 cn-north-1）；管理员级部署权限 |
+| QuickSight | 企业版，用户通过 IAM Identity Center 登录；QuickSight 用户邮箱与 Identity Center 邮箱一致 |
+| 模型 | OpenAI 兼容的 Chat Completions 端点，支持工具调用和流式输出，Runtime 能经公网 HTTPS 访问（Amazon Bedrock、各家 OpenAI 兼容接口，或用 LiteLLM 等网关转换其他接口） |
+| 部署机器 | macOS 或 Linux，Node.js 20+，Python 3.9+（带 `pip` 和 `boto3`），能访问 npm 和 PyPI（可用镜像：`npm config set registry …`、`PIP_INDEX_URL`）。不需要 Docker |
+| CDK 引导 | 每个账号 / 区域一次：`cd infra && npm ci && npx cdk bootstrap aws://<账号>/<区域>` |
+
+### 1. 配置
+
+```bash
+cp config.example.json config.json
+```
+
+| 配置项 | 含义 |
+|---|---|
+| `prefix` | 资源名前缀，2-12 个小写字母或数字（如 `qsca`） |
+| `region` | QuickSight 所在区域 |
+| `quickSight.namespace` / `allowedAnalysisIds` | QuickSight 命名空间（通常是 `default`）；允许接入聊天的分析（`["*"]` 表示任意分析，仍按用户权限检查） |
+| `identityCenter.samlEntityId` | 你自定的 SAML 受众，如 `urn:quicksight-chat-assistant:chat` |
+| `identityCenter.identityStoreId` / `region` | 可选：到哪里查用户显示名。默认：部署区域里的 Identity Center 实例 |
+| `dataAccess.vpc` | 数据库在 VPC 内时，数据工具 Lambda 使用的子网（数据库可公网访问时填 `null`）。最简单的做法是复用 QuickSight VPC 连接的子网 |
+| `dataAccess.vpc.securityGroupIds` | 给 Lambda 额外加的安全组（如数据库已放行的某个组） |
+| `dataAccess.vpc.createInterfaceEndpoints` | `true` 创建 QuickSight 和 Secrets Manager 接口端点（子网没有 NAT 时需要）；VPC 已有时填 `false` |
+| `dataAccess.datasourceSecretPrefix` | 数据库凭证密钥的名称前缀（默认 `quicksight-chat-assistant/datasource/`） |
+| `dataAccess.extraSecretArns` | 如果要复用 QuickSight 数据源自己使用的密钥，在这里列出 |
+| `mcpTargets` | 企业 MCP 服务器（见下文）；没有就填 `[]` |
+| `runtime.idleSeconds` / `maxLifetimeSeconds` | 会话空闲超时（300）和最长生命周期（28800 = 8 小时，也是任务的最长时长） |
+| `api.rateLimit` / `burstLimit` | HTTP API 限流 |
+| `frameAncestors` | 允许嵌入聊天页的来源（你所在区域的 QuickSight 控制台域名） |
+| `examples` | 可选：替换内置通用示例的部署级示例问题：`[{"group": "…", "tip": "…", "questions": ["…"]}]`，JSON 不超过 2500 字节。可用于针对客户数据做演示。带 `"edit": true`（或名称以“修改”开头）的分组在仪表盘里不显示 |
+
+### 2. 部署
+
+```bash
+./qsca --profile <aws-profile> deploy        # 把 Linux arm64 包构建到 build/，再执行 cdk deploy
+./qsca --profile <aws-profile> outputs       # ChatUrl、AcsUrl、SamlEntityId、ModelSecretName、IdpMetadataParameter 等
+```
+
+### 3. IAM Identity Center 应用（控制台，一次）
+
+自定义 SAML 应用不能用 API 创建。
+
+1. IAM Identity Center → **应用程序** → **添加应用程序** → **我有要设置的应用程序** → **SAML 2.0**。
+2. 下载 **IAM Identity Center 元数据** 文件。
+3. 应用程序 ACS URL 填输出 `AcsUrl`；应用程序 SAML 受众填输出 `SamlEntityId`。
+4. **操作 → 编辑属性映射**：`Subject` → `${user:email}`，格式 `emailAddress`。聊天页显示用户姓名：登录时按邮箱从用户目录读取
+   （中日韩姓名姓在前，如 杨志浩）。可选的 SAML 属性 `familyName` → `${user:familyName}`、`givenName` → `${user:givenName}`
+   优先。如果 Identity Center 在其他账号或区域，配置 `identityCenter.identityStoreId` / `region`；查不到时显示邮箱。
+5. **分配用户和组**：可以使用助手的人。
+6. 上传元数据（5 分钟内生效，无需重新部署）：
+
+```bash
+./qsca --profile <p> idp-metadata ~/Downloads/<metadata>.xml
+```
+
+### 4. 模型
+
+在 Secrets Manager 中以明文编辑 `<prefix>/model-config`（输出 `ModelSecretName`）：
+
+```json
+{"base_url": "https://your-endpoint/v1", "model": "model-name", "api_key": "your-key", "temperature": 0.2, "timeout": 120}
+```
+
+60 秒内生效；切换模型只需编辑这个密钥（旧版本保留在 Secrets Manager 中，可以回退）。也可以运行
+`./qsca --profile <p> model [--base-url … --model … --params '{…}' --timeout 180]`，它会提示输入 Key，输入不回显。
+不接受 `temperature` 的模型请去掉该字段。可选 `max_retries`（默认 4）在模型调用遇到 429、5xx 或连接失败时重试；响应流已经
+开始后才返回的错误，由 Agent 重试（最多 3 次）。可选 `params` 给每个 Chat Completions 请求附加字段（如
+`{"reasoning_effort": "medium"}`）。提问和查询结果会发送到这个端点：请确认符合数据合规要求，并使用 HTTPS。
+
+Amazon Bedrock（`bedrock-runtime` 端点上的 Chat Completions，Bedrock API Key），以 Kimi K3 为例：
+
+```json
+{"base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1", "model": "us.moonshotai.kimi-k3",
+ "api_key": "<Bedrock API key>", "timeout": 180,
+ "params": {"reasoning_effort": "medium", "max_tokens": 8192}}
+```
+
+AWS 中国区没有 Bedrock，从中国区调用会跨境访问海外区域；请确认数据可以这样处理。Kimi K3 实测记录（2026 年 10 月）：
+
+- 默认按 `max` 档推理，对聊天来说太慢；请用 `medium`（`low` 在修改类请求上会卡死）。
+- `us.moonshotai.kimi-k3` 比 `global.moonshotai.kimi-k3` 快 2-5 倍。
+- 无论推理档位和温度，约六分之一的回答会变成乱码，直到 `max_tokens` 才结束（1-2 分钟后给出明确报错）。请保留
+  `max_tokens`。偶发的 HTTP 500（包括响应流中途的）会自动重试。
+- Bedrock 长期 API Key 会过期（模型返回 `401 Authentication failed` 表示需要换新 Key）。
+
+换模型后请运行 `tests/e2e.py`：模型填写工具参数的能力决定了速度和准确性。
+
+### 5. 数据库凭证（内置数据查询）
+
+QuickSight 不会提供已保存的数据库密码。分析用到的每个 QuickSight **数据源**，都要在同一区域保存一个 **只读** 账号：
+
+- 名称 `<datasourceSecretPrefix><DataSourceId>`，内容 `{"username": "...", "password": "..."}`
+- `./qsca --profile <p> datasource-secret <DataSourceId>` 可创建；`./qsca check --analysis <id>` 列出需要哪些。
+
+在数据库安全组里放行数据工具 Lambda（它的安全组、子网网段，或你通过 `securityGroupIds` 加上的组）。通过 VPC 对等连接访问
+其他区域的数据库也可以。
+
+### 6. 接入分析
+
+自助方式，不用命令行：在分析编辑界面添加 **自定义可视内容**（Custom visual content），网址填原样的 `ChatUrl`（输出，如
+`https://<api>.execute-api.<region>.amazonaws.com.cn/`），在其中登录，从列出的分析里点选它所在的分析（刚编辑过的排在最前）
+即可绑定。绑定会补上分析 ID 和全部参数，与 `attach` 生成的地址相同；之后刷新编辑界面。绑定需要该分析的编辑权限。以后增删了
+参数，聊天窗口会提示 **更新绑定**。也可以用命令行：
+
+```bash
+./qsca --profile <p> attach <analysis-id>            # 只打印嵌入地址
+./qsca --profile <p> attach <analysis-id> --apply    # 把聊天可视对象加进分析（备份保存在 build/）
+```
+
+地址带上了分析的全部参数（`?analysis=<id>&p.<name>=<<$name>>…`），聊天窗口由此知道当前控件值。选项：`--sheet <id>`、
+`--replace <visual_id>`（占用某个已有可视对象的位置）。增删参数后重新运行，然后用下面的命令发布仪表盘
+
+```bash
+./qsca --profile <p> publish <analysis-id> <dashboard-id> [--name "…"]   # 创建或更新，然后发布
+```
+
+或者直接在 QuickSight 控制台点 **发布**。浏览器不会告诉聊天窗口自己在哪个 QuickSight 页面，控制台发布又会原样复制分析里的
+聊天地址，所以每次发布仪表盘后（控制台或 API），EventBridge 规则会运行 `<prefix>-dashboard-publisher` Lambda：在新版本里给
+本方案的聊天地址加上 `where=dashboard` 并发布（约 20 秒，之后刷新仪表盘）。仪表盘里的聊天因此不提供修改（修改只作用于分析，
+不会改已发布的仪表盘），并提示到哪里修改。仪表盘还会打上来源分析的标签，只有仪表盘权限的用户仍可使用。`qsca publish` 一步
+完成同样的事。可选：建一个参数 `pViewer`，动态默认值为当前用户邮箱，聊天窗口可以借此发现同一浏览器里切换了 QuickSight 用户
+（不用于授权）。
+
+### 7. 检查
+
+```bash
+./qsca --profile <p> check --analysis <analysis-id>                 # 模型、Identity Center、聊天可视对象、凭证
+./qsca --profile <p> smoke --analysis <analysis-id> --email <user>  # 端到端问一个问题（管理员：会读取签名密钥）
+python3 tests/e2e.py --profile <p> --analysis <id> --editor <email> [--other-editor <email>] \
+  [--visual <line/bar visual id>] [--dataset <dataset id> --control-column <column>] \
+  [--dataset-identifier <identifier> --category-column <column> --measure-column <numeric column>]
+```
+
+### 企业 MCP 服务器（可选）
+
+```json
+"mcpTargets": [
+  {"name": "datahub", "endpoint": "https://mcphub.example.com/datahub/mcp",
+   "auth": {"type": "oauth", "providerArn": "arn:aws-cn:bedrock-agentcore:cn-north-1:<acct>:token-vault/default/oauth2credentialprovider/datahub", "scopes": ["read"]}},
+  {"name": "metabase", "endpoint": "https://mcphub.example.com/metabase/mcp",
+   "auth": {"type": "apiKey", "providerArn": "arn:aws-cn:...:apikeycredentialprovider/metabase", "parameterName": "X-API-Key"}}
+]
+```
+
+`auth.type`：`none`、`oauth` / `apiKey`（先创建 AgentCore Identity 凭证提供程序），或 `iam`（`service: "bedrock-agentcore"`、
+`runtimeArn`、可选 `region`，用于部署在 AgentCore Runtime 上的 MCP 服务器）。端点必须是公网 HTTPS（中国区的 Gateway 没有
+VPC 出口），并支持 MCP 协议 `2025-03-26`。这些服务器收不到用户身份：只开放只读工具。
+
+### 更新、回滚、卸载
+
+- 更新：拉取新代码后 `./qsca deploy`。模型密钥、Identity Center 元数据和凭证会保留。
+- 回滚：部署上一个版本的代码。
+- 卸载：`cd infra && AWS_PROFILE=<p> npx cdk destroy --context config=../config.json`。有意保留的资源：S3 备份桶、SSM 参数
+  `/<prefix>/idp-metadata`、数据源密钥、分析里的聊天可视对象、Identity Center 应用。
 
 ## 使用
 
 ### 给新分析加上聊天窗口（不需要管理员）
 
-有分析编辑权限的人，在 QuickSight 编辑界面里就能自己加：
+有分析编辑权限的人，都可以在 QuickSight 编辑界面里自己加上助手：
 
 1. **添加可视对象 → 自定义可视内容**（Custom visual content），摆好位置和大小（比如放在右侧一列）。
-2. 网址填管理员提供的聊天地址，即部署输出的 `ChatUrl` 原样填写，例如 `https://<api-id>.execute-api.cn-north-1.amazonaws.com.cn/`，斜杠后面不要加任何内容。
-3. 在新加的可视对象里点 **使用 Identity Center 登录**。聊天窗口会提示“还没有绑定分析”，并列出你能编辑的分析，最近修改的排在前面（正在编辑的这个通常在第一个）。
+2. 网址填管理员提供的聊天地址：栈输出 `ChatUrl` 原样填写，如 `https://<api-id>.execute-api.cn-north-1.amazonaws.com.cn/`，
+   斜杠后面不加任何内容。
+3. 在新加的可视对象里点 **使用 Identity Center 登录**。聊天窗口提示还没有绑定，并列出你能编辑的分析，最近修改的排在前面
+   （正在编辑的这个通常在第一个）。
 4. 点选这个分析。聊天窗口会补上分析 ID 和全部参数（这样才能拿到当前控件值），并保存分析。
-5. **刷新浏览器页面**，聊天窗口即可在这个分析里使用。之后照常发布仪表盘（控制台“发布”，或在聊天里点/说“发布到仪表盘”），仪表盘里的聊天会自动识别自己在仪表盘中。
+5. **刷新浏览器页面**，聊天窗口即可在这个分析里使用。照常发布仪表盘（控制台 **发布**，或在聊天里点 **发布到仪表盘**）；
+   仪表盘里的聊天知道自己在仪表盘中。
 
-说明：需要该分析的编辑权限；如果管理员在 `quickSight.allowedAnalysisIds` 里限定了分析，新分析要在名单内。以后分析增删了参数，聊天窗口会出现 **更新绑定**，点一下再刷新即可。管理员也可以继续用命令行 `./qsca attach <分析ID> --apply`。
+说明：需要该分析的编辑权限；如果管理员限定了 `quickSight.allowedAnalysisIds`，这个分析必须在名单内。以后增删参数时，聊天窗口
+会显示 **更新绑定**：点一下再刷新即可。管理员仍可用命令行 `./qsca attach <analysis-id> --apply` 完成同样的事。
 
 ### 自定义示例问题
 
-输入框下方的 **示例问题** 在分析有自己的一套之前显示部署级默认：内置的是一个适用于任何分析的问题；管理员也可以在 `config.json` 的 `examples` 里配置。分析的编辑者在聊天窗口里维护这一套；能看这个分析、以及由它发布的仪表盘的人都能看到（仪表盘里不显示名称含“修改”的分组）。
+在分析有自己的一套示例之前，输入框下方的 **示例问题** 栏显示部署级默认：一个适用于任何分析的问题，或管理员在 `config.json`
+的 `examples` 里配置的分组。分析的编辑者在聊天里维护这一套；分析的查看者、以及由它发布的仪表盘的查看者都能看到（名称含“修改”
+的分组在仪表盘里不显示）。
 
-- 自己问过的问题下方有 **☆ 加入示例**，点一下加入“常用问题”分组（第一次加入时，会保留当时显示的默认示例）。
-- **示例问题** 旁的 **管理** 打开编辑器：每个分组有名称、可选说明、每行一个问题；可以添加/删除分组、**保存**，或 **恢复默认**（删除分析自己的那一套；删光所有分组再保存效果相同）。
-- 想先要一些建议，可以直接问助手，例如“给这个分析出一些示例问题”，它会按真实的图表、字段和参数列出问题；把需要的粘贴到 **管理** 里保存即可。
+- 自己问过的问题下方有 **☆ 加入示例**，点一下加入“常用问题”分组（第一次加入时，保留当时显示的默认示例）。
+- **示例问题** 旁的 **管理** 打开编辑器：每个分组有名称、可选说明、每行一个问题；可以添加或删除分组、**保存**，或点
+  **恢复默认** 删除分析自己的那一套（删除所有分组后保存，效果相同）。
+- 想先要一些建议，可以问助手，如“给这个分析出一些示例问题”；它会按真实的图表、字段和参数列出问题。把需要的粘贴到 **管理**
+  里保存。
 
-限制：最多 8 个分组、每组 20 个问题、每个问题 200 字。保存后立即生效，无需重新部署。
+限制：8 个分组，每组 20 个问题，每个问题 200 字。修改立即生效，无需重新部署。
 
 ### 提问与修改
 
-1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码），有效期 8 小时。输入框下方折叠的 **示例问题** 栏按分组列出了示例，展开后点击即可提问。
+1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码）。会话有效期 8 小时。
+   示例问题在输入框下方折叠的 **示例问题** 栏里，每组一个标签；点一个即提问。
 2. 提问示例：
-   - 这个分析有哪些图表，各自展示什么？
-   - 按当前筛选，最近一个月的平均价格走势如何？画个图。
-   - 计算主要指标的每月环比，并给各场站排名。（沙箱里用 pandas 计算）
-   - 在仪表盘上只看某某场站。（列出要在控件里选的值）
-3. 修改分析（需要该分析的编辑权限，在分析编辑界面里）：
-   - “把价格走势改成柱状图”“改成按月显示”“改用电量的总和”“按场站分组”“按数值降序”“标题改成……”“新增一个按场站统计平均价格的表格”“删除这个图表”
-   - 每次都会先出 **预览**（用修改后的口径画图或表格），点 **应用到分析** 才写入，点 **不用了** 放弃；预览 10 分钟内有效。
-   - 应用后需要 **手动刷新页面**；说 **撤销** 恢复最近一次已应用的修改，可连续撤销。应用后可点 **发布到仪表盘**（或直接发送“发布到仪表盘”），把分析当前内容发布到由它发布、你有更新权限的仪表盘（自动带上仪表盘标记）；刷新页面后按钮仍在。只改分析，仪表盘需重新发布；仪表盘里的聊天窗口不提供修改。
-4. 等待时可点 **取消**；切换控件导致页面刷新后，会自动继续获取刚才的回答。本浏览器按用户和分析保存 8 小时内的对话。
+   - *这个分析有哪些图表，各自展示什么？*
+   - *按当前筛选，上个月的平均价格走势如何？画出来。*
+   - *计算主要指标的每月环比，并给各场站排名。*（沙箱里用 pandas 计算）
+   - *在仪表盘上只看某某场站。*（列出要在控件里选的值）
+3. 修改分析（有编辑权限的用户，在分析编辑界面里）：
+   - *把“价格走势”改成柱状图* · *改成按月显示* · *改用电量的总和* · *按场站分组*
+   - *按数值降序* · *标题改成……* · *新增一个按场站统计平均价格的表格* · *删除这个图表*
+   - 每个请求都会显示 **预览**（用修改后的口径画出的图表或表格），并带 **应用到分析** / **不用了**。应用后请 **刷新页面**
+     （编辑界面不会自动刷新）。说 **撤销** 恢复最近一次已应用的修改（可连续撤销）。点 **应用到分析** 后，**发布到仪表盘**
+     （或直接发送“发布到仪表盘”）把分析的当前内容发布到由它发布、用户有权更新的仪表盘，并给聊天打上标记；刷新页面后按钮仍在。
+     修改只作用于分析；要更新仪表盘需重新发布。仪表盘里的聊天不提供修改。
+4. **取消** 停止正在进行的回答；页面刷新后（如选择了控件值）会继续获取正在进行的回答。浏览器按用户和分析保存 8 小时内的对话。
 
 ## 安全
 
-见英文部分 [Security](#security)。要点：只允许分配到 Identity Center 应用的用户登录；按 QuickSight 自身的共享权限决定谁能看、谁能改；
-启用了行级权限、过滤条件或联接的数据集拒绝内置查询，列级权限限制的列对无权用户隐藏；模型不写 SQL；计算沙箱无网络、只拿到结果行；
-修改前备份到 S3，只有发起人能在 10 分钟内应用一次；用户令牌只由代码附加给本方案自己的工具，模型看不到也无法伪造。
+| 方面 | 机制 |
+|---|---|
+| 登录 | 只有分配到 Identity Center 应用的用户；SAML 断言校验签名、受众、ACS、有效期和重放 |
+| 会话 | HMAC 签名的令牌，8 小时，保存在 iframe 的浏览器存储中 |
+| 谁能看数据 | 用户必须能查看该分析或由它发布的仪表盘；只能查询该分析的数据集 |
+| 数据集规则 | 启用了行级权限、数据集筛选或联接的数据集拒绝查询（直接查源会绕过这些规则）；列级权限限制的列对未授权用户隐藏 |
+| 查询 | 模型从不写 SQL：结构化请求，列名按数据集校验，固定的聚合与运算符，绑定参数，只读事务，20 秒超时，最多 500 行 |
+| 沙箱 | Code Interpreter 为 SANDBOX 网络模式，没有执行角色：只拿到用户本来就能查询的结果行 |
+| 谁能修改 | 用户对该分析有 `quicksight:UpdateAnalysis`（QuickSight 共享）；只有发起人能在 10 分钟内应用一次；每次修改前都把原定义备份到 S3 |
+| 工具拿到的身份 | Runtime 在代码里把已验证的令牌附加到本方案自己的工具调用上；模型看不到也伪造不了；企业 MCP 服务器拿不到 |
+| 数据流向 | 提问和结果发送到你的模型端点；CloudWatch 日志里不含令牌或密码 |
 
-## 故障排查与限制
+SPICE 数据集：内置查询读取的是源数据的当前值，可能比上次 SPICE 刷新更新（回答里会说明）。
 
-见英文部分 [Troubleshooting](#troubleshooting) 与 [Limitations](#limitations)。常见：登录弹窗提示未配置 → 上传元数据；
-回答“管理员尚未配置模型” → 编辑模型密钥；“缺少数据库凭证” → 创建数据源密钥；“内置查询不支持这个数据集” → 数据集有 RLS、过滤或联接，
-可接入企业 MCP；应用后看不到变化 → 刷新页面、重新发布仪表盘；发布或应用修改后图表短暂显示“出现错误” → 页面还在用旧版本，刷新（有时要多刷几次）；模型报 `401` → API Key 失效或过期；1 到 2 分钟后提示“输出过长被截断” → 模型输出失控，重试或换更稳定的模型；
-回答慢 → 看 Runtime 日志 `answered` 事件里每次的 `setup_ms`、`tool_ms`、`model_ms`；聊天窗口显示邮箱而不是姓名 → 看 web Lambda 日志 `name_lookup_failed`。
+## 成本
+
+按用量计费：AgentCore Runtime（活跃会话的 CPU / 内存时长）、Gateway 调用、Code Interpreter 会话、Lambda、API Gateway、
+按需 DynamoDB、Secrets Manager 密钥、**VPC 接口端点（2 个端点 × 子网数，按小时计费；通常是最大的固定成本）**、CloudWatch
+Logs，以及你的模型。费用估算请使用 AWS 价格计算器。
+
+## 故障排查
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 弹窗提示登录未配置 | 上传 Identity Center 元数据（`./qsca idp-metadata`） |
+| `audience mismatch` / `bearer confirmation does not match` | SAML 受众或 ACS URL 与栈输出不一致 |
+| 登录后在 Identity Center 里报错 | 用户没有分配到该应用，或 `Subject` 没有映射到 `${user:email}` |
+| “管理员尚未配置模型” | 模型密钥还是占位内容 |
+| 模型报 `401 Authentication failed` | API Key 无效或已过期（Bedrock 长期 Key 会过期）：保存新 Key |
+| 回答 1-2 分钟后失败，提示“输出过长被截断” | 模型输出失控，触发了 `max_tokens`；重试，或换更稳定的模型 |
+| 回答慢 | Runtime 日志的 `answered` 事件里有每次调用的 `setup_ms`、`tool_ms`、`model_ms`；反复失败的工具调用或慢的模型调用会在这里体现 |
+| 聊天窗口显示邮箱而不是姓名 | 看 web Lambda 日志的 `name_lookup_failed`：用户不在用户目录里，或 Identity Center 在其他账号 / 区域（配置 `identityCenter.identityStoreId` / `region`） |
+| 没有分析的权限 | 用户在 QuickSight 里看不到它，或邮箱不一致 |
+| 缺少数据库凭证 | 创建数据源密钥（第 5 步） |
+| 内置查询不支持某个数据集 | 行级权限、数据集筛选、联接，或不支持的数据源；接入企业 MCP 服务器 |
+| 查询超时 / 连接错误 | 数据库安全组或路由没有放行数据工具 Lambda |
+| 聊天提示没有绑定分析 | 在聊天里点选分析完成绑定（需要编辑权限），或运行 `attach --apply` |
+| 已应用但没有变化 | 刷新页面；重新发布仪表盘 |
+| 刚发布或应用修改后图表显示“出现错误” | 页面还在用被替换的旧版本；刷新（有时要多刷几次） |
+
+日志：`/aws/lambda/<prefix>-web`、`/aws/lambda/<prefix>-analysis-tools`、`/aws/lambda/<prefix>-data-tools`，以及
+`/aws/bedrock-agentcore/runtimes/<prefix>_agent-…-DEFAULT`（每个会话一个日志流；`model_streaming` 事件表示某次模型调用超过
+20 秒，`model_retry` 表示自动重试）。
+
+## 限制
+
+- 内置数据查询：PostgreSQL、Aurora PostgreSQL、MySQL、Aurora MySQL、MariaDB、RDS（PostgreSQL / MySQL）；单表或自定义
+  SQL 数据集。Athena、Redshift、S3 等暂不支持（请接入企业 MCP 服务器）。
+- 修改支持折线图、柱状图和表格（聚合字段井）；使用分节布局的工作表不能自动新增可视对象；被筛选或动作引用的可视对象拒绝删除。
+- 使用计算字段的可视对象，只有参数切换型字段（`ifelse(${p} = '…', {col}, …)`）能预览。
+- 聊天不能修改控件；应用修改后编辑界面不会自动刷新；编辑界面里未保存的手动修改与已应用的修改可能互相覆盖。
+- 模型还在“思考”时取消，会在这一步结束时停止（几秒到几十秒）。
+
+## 开发
+
+```bash
+ACCOUNT_ID=0 SESSION_SECRET_ID=x QS_REGION=cn-north-1 AWS_DEFAULT_REGION=cn-north-1 python3 -m unittest discover -s tests/unit
+(cd infra && npm ci && npx tsc --noEmit)
+./qsca build
+```
+
+固定版本：strands-agents 1.61.1、bedrock-agentcore 1.24.2、boto3 1.43.115、signxml 5.2.0、lxml 6.1.3、cryptography 50.0.2、
+pg8000 1.31.5、PyMySQL 1.1.2、aws-cdk-lib 2.274.0、ECharts 6.1.0、marked 18.1.1、DOMPurify 3.4.17。
