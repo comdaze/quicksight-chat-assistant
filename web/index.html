@@ -344,7 +344,7 @@ function startLogin() {
     auth = { token: data.token, user: data.user };
     localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
     if (loginBox) { loginBox.remove(); loginBox = null; }
-    renderWho(); setInputEnabled(true); showGreeting(); $("q").focus();
+    renderWho(); startSession(false); $("q").focus();
   };
   window.addEventListener("message", onMessage);
   const watch = setInterval(() => {
@@ -536,7 +536,7 @@ function answerHtml(turn) {
 }
 async function ask(prompt, resumeJob) {
   if (!auth) { showLogin(); return; }
-  if (!ANALYSIS) { add("bot", "<p>聊天窗口没有绑定分析（嵌入地址缺少 analysis 参数）。请联系管理员用 qsca attach 重新接入。</p>", "err"); return; }
+  if (!ANALYSIS) { showBindChooser(); return; }
   $("send").disabled = true;
   add("user", render(prompt));
   const pending = add("bot", `<span class="typing">${resumeJob ? "页面已刷新，继续获取回答…" : "正在查询数据…"}</span>`);
@@ -607,7 +607,72 @@ function resumePending() {  // a control change reloads this iframe; pick up the
   }
   ask(saved.prompt, { jobId: saved.jobId, at: saved.at });
 }
-if (auth) { renderWho(); setInputEnabled(true); showGreeting(); replayHistory(); resumePending(); } else { showLogin(mismatchNotice || undefined); }
+// ---- Binding: a chat visual added with the bare chat URL (no analysis=) binds itself to its analysis on request ----
+function startSession(restore) {
+  if (!ANALYSIS) { showBindChooser(); return; }
+  setInputEnabled(true); showGreeting();
+  if (restore) { replayHistory(); resumePending(); }
+  if (!IN_DASHBOARD) checkBinding();
+}
+function bindNote(box, text, error) {
+  let note = box.querySelector(".note.bind");
+  if (!note) { note = document.createElement("p"); note.className = "note bind"; box.append(note); }
+  note.classList.toggle("err", !!error);
+  note.textContent = text;
+}
+async function bindTo(box, button, analysisId) {
+  box.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  button.textContent = "正在绑定…";
+  try {
+    const result = await api("/bind", { method: "POST", body: JSON.stringify({ analysis: analysisId }) });
+    bindNote(box, result.message || "已绑定，请刷新页面。");
+    button.textContent = "已绑定";
+  } catch (error) {
+    box.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+    button.textContent = "重试";
+    bindNote(box, `没有绑定：${error.message}`, true);
+  }
+}
+async function showBindChooser() {
+  setInputEnabled(false);
+  $("q").placeholder = "请先绑定分析";
+  if (IN_DASHBOARD) {
+    add("bot", "<p>这个聊天窗口还没有绑定分析。请到对应的分析里绑定，再重新发布仪表盘。</p>", "err");
+    return;
+  }
+  const box = add("bot", `<p>这个聊天窗口还没有绑定分析。选择它所在的分析（你刚编辑过的通常排在最前面），绑定后刷新页面即可使用。</p><p class="note">正在列出你可以编辑的分析…</p>`);
+  try {
+    const { analyses } = await api("/bindable");
+    box.querySelector(".note").remove();
+    if (!analyses.length) { bindNote(box, "没有找到你有编辑权限的分析。绑定需要该分析的编辑权限。", true); return; }
+    const list = document.createElement("div");
+    list.className = "hints";
+    for (const a of analyses) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = a.name + (a.has_unbound_chat ? "（含未绑定的聊天窗口）" : "");
+      button.title = `${a.analysis_id} · 最近修改 ${a.updated.slice(0, 16)}`;
+      button.onclick = () => bindTo(box, button, a.analysis_id);
+      list.append(button);
+    }
+    box.append(list);
+  } catch (error) {
+    bindNote(box, `无法列出分析：${error.message}`, true);
+  }
+}
+async function checkBinding() {  // parameters added or removed since binding: offer to update the chat URL
+  try {
+    const { parameters: names } = await api(`/binding?analysis=${encodeURIComponent(ANALYSIS)}`);
+    const expected = names.filter((n) => n !== "pViewer").sort().join(",");
+    const current = Object.keys(parameters).sort().join(",");
+    const viewerMissing = names.includes("pViewer") && !params.has("viewer");
+    if (expected === current && !viewerMissing) return;
+    const box = add("bot", `<p>这个分析的参数有变化，聊天窗口拿不到新参数的值。点“更新绑定”后刷新页面即可。</p><div class="hints"><button type="button">更新绑定</button></div>`);
+    const button = box.querySelector("button");
+    button.onclick = () => bindTo(box, button, ANALYSIS);
+  } catch {}  // no view permission or a transient error: the chat works as before
+}
+if (auth) { renderWho(); startSession(true); } else { showLogin(mismatchNotice || undefined); }
 </script>
 </body>
 </html>

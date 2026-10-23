@@ -16,6 +16,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 
@@ -257,9 +258,103 @@ def publish_dashboards(args):
             "message": "已发布。打开仪表盘后刷新页面即可看到（刚发布时图表可能短暂报错，再刷新一次）。"}
 
 
+BIND_CANDIDATES = 15  # most recently updated analyses checked for edit permission (keeps the call under the API timeout)
+
+
+def chat_url(base, analysis_id, parameter_names):
+    """The chat page URL for an analysis: its id plus every parameter as <<$name>> (same as `qsca attach`)."""
+    parts = [f"analysis={analysis_id}"]
+    if "pViewer" in parameter_names:
+        parts.append("viewer=<<$pViewer>>")
+    parts += [f"p.{name}=<<${name}>>" for name in parameter_names if name != "pViewer"]
+    return base.rstrip("/") + "/?" + "&".join(parts)
+
+
+def _parameter_names(definition):
+    return [next(iter(p.values()))["Name"] for p in definition.get("ParameterDeclarations", [])]
+
+
+def _chat_base(args):
+    base = str(args.get("_chat_url") or "").rstrip("/")
+    if not base.startswith("https://"):
+        raise ToolError("缺少聊天页地址")
+    return base
+
+
+def bindable_analyses(args):
+    """For an unbound chat visual: recently updated analyses this user may edit (the one being edited is usually
+    first, since adding the visual just updated it), and which of them already contain an unbound chat."""
+    email = caller.verify_token(args.get("_caller"))
+    base = _chat_base(args)
+    arns = caller.principals(email)
+    summaries = [a for a in caller._paged(qs.list_analyses, "AnalysisSummaryList")
+                 if a.get("Status", "").endswith("SUCCESSFUL")
+                 and ("*" in caller.ALLOWED_ANALYSES or a["AnalysisId"] in caller.ALLOWED_ANALYSES)]
+    summaries.sort(key=lambda a: a.get("LastUpdatedTime") or 0, reverse=True)
+    out = []
+    for summary in summaries[:BIND_CANDIDATES]:
+        aid = summary["AnalysisId"]
+        if not caller._has(caller.analysis_permissions(aid), arns, "quicksight:UpdateAnalysis"):
+            continue
+        _name, definition = _analysis(aid)
+        urls = [u for u in _chat_urls(definition) if u.startswith(base)]
+        out.append({"analysis_id": aid, "name": summary.get("Name") or aid,
+                    "updated": str(summary.get("LastUpdatedTime") or ""),
+                    "has_unbound_chat": any("analysis=" not in u for u in urls),
+                    "bound": any(f"analysis={aid}" in u for u in urls)})
+    return {"analyses": out}
+
+
+def _chat_urls(definition):
+    for sheet in definition.get("Sheets", []):
+        for visual in sheet.get("Visuals", []):
+            config = (visual.get("CustomContentVisual") or {}).get("ChartConfiguration") or {}
+            if config.get("ContentUrl"):
+                yield config["ContentUrl"]
+
+
+def chat_binding(args):
+    """The parameters the analysis has now, so a bound chat can tell its URL is out of date."""
+    _email, aid = caller.require_viewer(args)
+    _name, definition = _analysis(aid)
+    return {"analysis_id": aid, "parameters": _parameter_names(definition)}
+
+
+def bind_chat(args):
+    """Point this solution's chat visuals in the analysis (unbound, or bound to it with outdated parameters) at the
+    analysis: its id and all current parameters. Other custom visuals are left alone."""
+    email, aid = caller.require_editor(args)
+    base = _chat_base(args)
+    name, definition = _analysis(aid)
+    url = chat_url(base, aid, _parameter_names(definition))
+    changed = 0
+    for sheet in definition.get("Sheets", []):
+        for visual in sheet.get("Visuals", []):
+            config = (visual.get("CustomContentVisual") or {}).get("ChartConfiguration") or {}
+            current = config.get("ContentUrl") or ""
+            if not current.startswith(base):
+                continue
+            match = re.search(r"[?&]analysis=([^&]*)", current)
+            if match and match.group(1) != aid:
+                continue  # a chat copied from another analysis is left for its owner to rebind
+            if current != url:
+                config["ContentUrl"] = url
+                changed += 1
+    if not changed:
+        return {"changed": False, "analysis_id": aid, "message": "聊天窗口已经绑定到这个分析，参数也是最新的。"}
+    if len(url) > 2048:
+        raise ToolError("分析的参数太多，聊天地址会超过 2048 个字符；请减少参数后再绑定")
+    _save(aid, name, definition)
+    log(event="chat_bound", by=email, analysis=aid, visuals=changed, parameters=len(_parameter_names(definition)))
+    return {"changed": True, "analysis_id": aid, "name": name,
+            "message": "已绑定。请刷新页面（编辑界面刷新后聊天窗口才会用上新地址）。"}
+
+
 TOOLS = {"describe_analysis": describe_analysis, "preview_analysis_change": preview_analysis_change,
          "apply_pending_change": apply_pending_change, "undo_last_visual_change": undo_last_visual_change,
-         "publish_dashboards": publish_dashboards}
+         "publish_dashboards": publish_dashboards, "bindable_analyses": bindable_analyses,
+         "chat_binding": chat_binding, "bind_chat": bind_chat}
+BUTTON_ONLY = ("apply_pending_change", "publish_dashboards", "bindable_analyses", "chat_binding", "bind_chat")
 
 
 def handler(event, context):
@@ -268,7 +363,7 @@ def handler(event, context):
     custom = getattr(getattr(context, "client_context", None), "custom", None) or {}
     if custom.get("bedrockAgentCoreToolName"):
         name = custom["bedrockAgentCoreToolName"].split("___", 1)[-1]
-        if name in ("apply_pending_change", "publish_dashboards"):  # defence in depth: not on the gateway
+        if name in BUTTON_ONLY:  # defence in depth: these are not on the gateway
             return {"error": f"{name} 只能由聊天页的按钮触发"}
     tool = TOOLS.get(name)
     if tool is None:

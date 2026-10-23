@@ -11,6 +11,9 @@ Routes:
   POST /jobs/{id}/cancel       cancel a running job
   POST /changes/{id}/apply     the 应用到分析 button: apply a previewed analysis change as this user
   POST /dashboards/publish     the 发布到仪表盘 button: publish the analysis to its dashboards as this user
+  GET  /bindable               an unbound chat visual: analyses this user may bind it to
+  GET  /binding?analysis=ID    the analysis' current parameters (the page checks its URL is up to date)
+  POST /bind                   the 绑定 / 更新绑定 button: point the chat visual(s) in the analysis at it
 """
 
 import base64
@@ -282,6 +285,22 @@ def publish_dashboards(event, user):
     return respond(409 if "error" in result else 200, result)
 
 
+def run_button_tool(event, user, tool, analysis=None):
+    """Button-only analysis tools (never the model): the analysis-tools Lambda checks this user's permissions."""
+    payload = {"__tool": tool, "_caller": bearer(event),
+               "_chat_url": f"https://{event.get('requestContext', {}).get('domainName', '')}"}
+    if analysis is not None:
+        if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
+            return respond(400, {"error": "invalid analysis"})
+        payload["_analysis"] = analysis
+    response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(payload).encode("utf-8"))
+    result = json.loads(response["Payload"].read() or b"{}")
+    if tool == "bind_chat":
+        print(json.dumps({"user": user["sub"], "event": "bind_chat", "analysis": analysis, "ok": "error" not in result,
+                          "changed": result.get("changed"), "error": result.get("error")}, ensure_ascii=False))
+    return respond(409 if "error" in result else 200, result)
+
+
 def run_publish(event, user, analysis):
     domain = event.get("requestContext", {}).get("domainName", "")
     response = lambda_client.invoke(FunctionName=ANALYSIS_TOOLS_FN, Payload=json.dumps(
@@ -342,6 +361,16 @@ def handler(event, context):
         return apply_change(path.split("/")[2], event, user)
     if method == "POST" and path == "/dashboards/publish":
         return publish_dashboards(event, user)
+    if method == "GET" and path == "/bindable":
+        return run_button_tool(event, user, "bindable_analyses")
+    if method == "GET" and path == "/binding":
+        return run_button_tool(event, user, "chat_binding", (event.get("queryStringParameters") or {}).get("analysis"))
+    if method == "POST" and path == "/bind":
+        try:
+            body = request_json(event)
+        except ValueError:
+            body = {}
+        return run_button_tool(event, user, "bind_chat", body.get("analysis"))
     if method == "POST" and re.fullmatch(r"/jobs/[0-9a-f]{32}/cancel", path):
         return cancel(path.split("/")[2], user)
     if method == "GET" and re.fullmatch(r"/jobs/[0-9a-f]{32}", path):

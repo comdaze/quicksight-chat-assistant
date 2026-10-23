@@ -54,5 +54,20 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(publisher.ids_from(api), ("d2", ""))
 
 
+
+class BindTest(unittest.TestCase):
+    """bind_chat's URL rule: the same as `qsca attach` (analysis id, viewer, every parameter as <<$name>>)."""
+
+    def test_chat_url_matches_attach(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools", "common"))
+        for key, value in (("SESSION_SECRET_ID", "x"), ("BACKUP_BUCKET", "b"), ("JOBS_TABLE", "t")):
+            os.environ.setdefault(key, value)
+        import handler  # noqa: PLC0415 - analysis tools; needs the env above
+        url = handler.chat_url("https://chat.example.com/", "a1", ["pStation", "pViewer", "pStartDate"])
+        self.assertEqual(url, "https://chat.example.com/?analysis=a1&viewer=<<$pViewer>>"
+                              "&p.pStation=<<$pStation>>&p.pStartDate=<<$pStartDate>>")
+        self.assertEqual(handler.chat_url("https://chat.example.com", "a2", []), "https://chat.example.com/?analysis=a2")
+
+
 if __name__ == "__main__":
     unittest.main()

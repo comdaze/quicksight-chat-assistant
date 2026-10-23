@@ -179,6 +179,12 @@ via `securityGroupIds`). Cross-region databases over VPC peering work as well.
 
 ### 6. Attach to an analysis
 
+Self-service, no command line: in the analysis editor add a **Custom visual content** whose URL is the bare
+`ChatUrl` (output, e.g. `https://<api>.execute-api.<region>.amazonaws.com.cn/`), sign in inside it, and pick the
+analysis in the list it shows (the one just edited comes first) and press it to bind. That fills in the analysis id
+and every parameter, the same URL `attach` builds; refresh the editor. Binding needs edit permission on the
+analysis. When parameters are added or removed later, the chat offers **更新绑定**. Or from the command line:
+
 ```bash
 ./qsca --profile <p> attach <analysis-id>            # print the embed URL only
 ./qsca --profile <p> attach <analysis-id> --apply    # add the chat visual (backup saved under build/)
@@ -296,7 +302,7 @@ the largest fixed cost)**, CloudWatch Logs, plus your model. Use the AWS pricing
 | Missing database credentials | Create the data source secret (step 5) |
 | Built-in query does not support a dataset | RLS, dataset filters, joins, or an unsupported source; add an enterprise MCP server |
 | Query timeout / connection error | Database security group or routing does not allow the data tools Lambda |
-| Chat says it is not bound to an analysis | Embed URL lacks `analysis=`: run `attach --apply` again |
+| Chat says it is not bound to an analysis | Pick the analysis in the chat to bind it (edit permission needed), or run `attach --apply` |
 | Applied but nothing changed | Refresh the page; republish the dashboard |
 | Visuals show "出现错误" right after a publish or an applied change | The page still uses the replaced version; refresh (sometimes a few times) |
 
@@ -366,7 +372,7 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 4. **Identity Center 应用（控制台手工操作）**：应用程序 → 添加应用程序 → 我有要设置的应用程序 → SAML 2.0；下载元数据；ACS URL 填 `AcsUrl`，SAML 受众填 `SamlEntityId`；编辑属性映射 `Subject` = `${user:email}`、格式 `emailAddress`（聊天窗口显示的姓名在登录时按邮箱从 Identity Center 用户目录读取，中文名按"姓+名"显示；断言里的 `familyName`、`givenName` 属性优先；Identity Center 在其他账号或区域时配置 `identityCenter.identityStoreId` / `region`，查不到就显示邮箱）；分配用户和组；然后 `./qsca --profile <p> idp-metadata <元数据.xml>`。
 5. **模型**：在 Secrets Manager 编辑 `<prefix>/model-config`，填入 `{"base_url":"https://…/v1","model":"…","api_key":"…","temperature":0.2,"timeout":120}`，60 秒内生效，Secrets Manager 保留旧版本便于回退；或 `./qsca model`（可带 `--base-url`、`--model`、`--params`、`--timeout`，Key 输入不回显）。不接受 `temperature` 的模型去掉该字段。可选 `max_retries`（默认 4）在模型返回 429、5xx 或连接失败时重试，响应流中途的错误由 Agent 再重试最多 3 次；可选 `params` 给每个请求附加字段（如 `{"reasoning_effort":"medium"}`）。使用 Amazon Bedrock 时 `base_url` 填 `https://bedrock-runtime.<区域>.amazonaws.com/openai/v1`、`api_key` 填 Bedrock API Key（Kimi K3 的模型 ID 如 `global.moonshotai.kimi-k3`（全球路由）或 `us.moonshotai.kimi-k3`（仅美国区域），建议 `params` 为 `{"reasoning_effort":"medium","max_tokens":8192}`；实测 `us.` 比 `global.` 快 2 到 5 倍，`low` 在修改分析类请求上会卡死；无论推理档位和温度，约六分之一的回答会变成乱码，直到 `max_tokens` 才结束，所以必须设 `max_tokens`；偶发的 500 会自动重试；Bedrock 长期 API Key 会过期，模型报 `401 Authentication failed` 时换新 Key）。换模型后建议跑一遍 `tests/e2e.py`；中国区没有 Bedrock，从中国区调用会跨境访问海外区域，需确认数据合规。提问与查询结果会发送到该端点，请确认合规并使用 HTTPS。
 6. **数据库凭证**：为分析用到的每个 QuickSight 数据源，在同一区域创建只读账号密钥 `<前缀><DataSourceId>`，内容 `{"username","password"}`（`./qsca datasource-secret <DataSourceId>`）；数据库安全组放行数据工具 Lambda。
-7. **接入分析**：`./qsca --profile <p> attach <分析ID> --apply`（只打印地址时去掉 `--apply`；`--replace <visual_id>` 可替换已有图表的位置），然后在 QuickSight 控制台照常发布仪表盘（或 `./qsca --profile <p> publish <分析ID> <仪表盘ID>`）：浏览器不会告诉聊天窗口自己在哪个页面，控制台发布又会原样复制分析里的聊天地址，所以每次发布后 EventBridge 会触发 `<前缀>-dashboard-publisher` Lambda，在新版本的聊天地址里加 `where=dashboard` 并发布（约 20 秒，之后刷新仪表盘）；仪表盘里的聊天就不提供修改（修改只作用于分析），并提示到分析里改；仪表盘还会打上来源分析的标签，只有仪表盘权限的用户仍可使用。可选：建参数 `pViewer`（动态默认值为当前用户邮箱），用于检测同一浏览器切换了 QuickSight 用户。
+7. **接入分析**：自助方式，不用命令行：在分析编辑界面添加“自定义可视内容”（Custom visual content），网址填部署输出的 `ChatUrl`（不带任何参数），在聊天窗口里登录后，从列出的分析中点选它所在的分析（刚编辑过的排在最前）即可绑定，绑定会补上分析 ID 和全部参数，刷新编辑界面后可用；需要该分析的编辑权限；以后分析增删了参数，聊天窗口会提示“更新绑定”。命令行方式：`./qsca --profile <p> attach <分析ID> --apply`（只打印地址时去掉 `--apply`；`--replace <visual_id>` 可替换已有图表的位置），然后在 QuickSight 控制台照常发布仪表盘（或 `./qsca --profile <p> publish <分析ID> <仪表盘ID>`）：浏览器不会告诉聊天窗口自己在哪个页面，控制台发布又会原样复制分析里的聊天地址，所以每次发布后 EventBridge 会触发 `<前缀>-dashboard-publisher` Lambda，在新版本的聊天地址里加 `where=dashboard` 并发布（约 20 秒，之后刷新仪表盘）；仪表盘里的聊天就不提供修改（修改只作用于分析），并提示到分析里改；仪表盘还会打上来源分析的标签，只有仪表盘权限的用户仍可使用。可选：建参数 `pViewer`（动态默认值为当前用户邮箱），用于检测同一浏览器切换了 QuickSight 用户。
 8. **自检**：`./qsca --profile <p> check --analysis <分析ID>`；管理员可用 `smoke` 和 `tests/e2e.py` 做端到端测试。
 9. **企业 MCP**：在 `mcpTargets` 中配置（示例见英文部分），重新 `deploy`。端点须为公网 HTTPS（中国区 Gateway 不能访问 VPC 内地址），支持 MCP 协议 `2025-03-26`；这些服务收不到用户身份，只开放只读工具。
 10. **更新 / 回滚 / 卸载**：更新拉代码后 `deploy`（模型、元数据、凭证不会被覆盖）；回滚用上一个版本代码 `deploy`；卸载 `cd infra && AWS_PROFILE=<p> npx cdk destroy --context config=../config.json`，S3 备份桶、SSM 元数据参数、数据源密钥、分析中的聊天可视对象、Identity Center 应用需手动清理。

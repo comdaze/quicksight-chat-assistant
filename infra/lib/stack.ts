@@ -105,6 +105,8 @@ export class ChatAssistantStack extends Stack {
     analysisFn.addToRolePolicy(quicksightRead);
     analysisFn.addToRolePolicy(quicksightPeople);
     analysisFn.addToRolePolicy(quicksightDashboards);
+    // Binding a new chat visual: list the analyses the user might be editing (permissions checked per analysis).
+    analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:ListAnalyses'], resources: ['*'] }));
     analysisFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['quicksight:UpdateAnalysis'], resources: analysisResources }));
     // The 发布到仪表盘 button: publish the analysis to its dashboards (users' dashboard permissions checked in code).
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
