@@ -14,6 +14,8 @@ Routes:
   GET  /bindable               an unbound chat visual: analyses this user may bind it to
   GET  /binding?analysis=ID    the analysis' current parameters (the page checks its URL is up to date)
   POST /bind                   the 绑定 / 更新绑定 button: point the chat visual(s) in the analysis at it
+  GET  /examples?analysis=ID   the analysis' example questions (none: the page shows the default) and can_edit
+  POST /examples               editors save the analysis' examples: {groups} | {add: {question, group}} | {reset}
 """
 
 import base64
@@ -285,10 +287,10 @@ def publish_dashboards(event, user):
     return respond(409 if "error" in result else 200, result)
 
 
-def run_button_tool(event, user, tool, analysis=None):
+def run_button_tool(event, user, tool, analysis=None, extra=None):
     """Button-only analysis tools (never the model): the analysis-tools Lambda checks this user's permissions."""
     payload = {"__tool": tool, "_caller": bearer(event),
-               "_chat_url": f"https://{event.get('requestContext', {}).get('domainName', '')}"}
+               "_chat_url": f"https://{event.get('requestContext', {}).get('domainName', '')}", **(extra or {})}
     if analysis is not None:
         if not isinstance(analysis, str) or not ANALYSIS_ID.match(analysis):
             return respond(400, {"error": "invalid analysis"})
@@ -365,6 +367,15 @@ def handler(event, context):
         return run_button_tool(event, user, "bindable_analyses")
     if method == "GET" and path == "/binding":
         return run_button_tool(event, user, "chat_binding", (event.get("queryStringParameters") or {}).get("analysis"))
+    if method == "GET" and path == "/examples":
+        return run_button_tool(event, user, "get_examples", (event.get("queryStringParameters") or {}).get("analysis"))
+    if method == "POST" and path == "/examples":
+        try:
+            body = request_json(event)
+        except ValueError:
+            body = {}
+        extra = {k: body[k] for k in ("groups", "add", "reset", "base") if k in body}
+        return run_button_tool(event, user, "save_examples", body.get("analysis"), extra)
     if method == "POST" and path == "/bind":
         try:
             body = request_json(event)

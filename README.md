@@ -243,9 +243,45 @@ These servers never receive the user's identity: expose read-only tools only.
 
 ## Use
 
+### Add the chat to a new analysis (no admin needed)
+
+Anyone who can edit an analysis can add the assistant to it in the QuickSight editor:
+
+1. **Add a visual → Custom visual content** (自定义可视内容), place and size it (for example a column on the right).
+2. Set its URL to the chat address your administrator shares: the stack output `ChatUrl` exactly as it is, e.g.
+   `https://<api-id>.execute-api.cn-north-1.amazonaws.com.cn/`, with nothing after the slash.
+3. In the new visual, click **使用 Identity Center 登录**. The chat says it is not bound yet and lists the analyses you
+   can edit, most recently changed first (the one you are editing is normally at the top).
+4. Click this analysis. The chat fills in the analysis id and all of its parameters (so it sees the current control
+   values) and saves the analysis.
+5. **Refresh the browser page.** The chat now works in this analysis. Publish the dashboard as usual (console
+   **Publish**, or **发布到仪表盘** in the chat); its chat knows it is in a dashboard.
+
+Notes: you need edit permission on the analysis; if the administrator limited `quickSight.allowedAnalysisIds`, the
+analysis must be on that list. When you later add or remove parameters, the chat shows **更新绑定**: click it and
+refresh. Administrators can still do the same from the command line with `./qsca attach <analysis-id> --apply`.
+
+### Customize the example questions
+
+The **示例问题** bar under the input box shows the deployment default until an analysis has its own set: one
+question that fits any analysis, or the groups in `examples` of `config.json` if the administrator set them. Editors of the analysis maintain that set in the chat; viewers of the analysis and
+of the dashboards published from it see it (groups whose name contains 修改 are hidden in dashboards).
+
+- **☆ 加入示例** under any question you asked adds it to the group 常用问题 (the first time, the default examples
+  shown at that moment are kept next to it).
+- **管理** next to **示例问题** opens an editor: one box per group with a name, an optional tip and one question per
+  line; add or delete groups, **保存**, or **恢复默认** to drop the analysis' set (saving with every group
+  deleted does the same).
+- To start from suggestions, ask the assistant, e.g. *Suggest some example questions for this analysis*; it lists
+  questions based on the real visuals, fields and parameters. Paste the ones you want into **管理** and save.
+
+Limits: 8 groups, 20 questions per group, 200 characters per question. Changes apply at once, no redeploy.
+
+### Ask and edit
+
 1. Open an analysis or dashboard with the assistant, click **Sign in with Identity Center** (usually no password when
    already signed in to QuickSight). The session lasts 8 hours. Example questions sit in the collapsed **示例问题** bar
-   under the input box, one tab per capability; clicking one asks it.
+   under the input box, one tab per group; clicking one asks it.
 2. Ask, for example:
    - *Which visuals does this analysis have and what do they show?*
    - *Under the current filters, how did the average price trend last month? Draw it.*
@@ -379,7 +415,31 @@ AgentCore Runtime 上的 Agent 通过 Gateway 调用三类工具（分析工具�
 
 ## 使用
 
-1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码），有效期 8 小时。输入框下方折叠的 **示例问题** 栏按能力分标签列出了示例，展开后点击即可提问。
+### 给新分析加上聊天窗口（不需要管理员）
+
+有分析编辑权限的人，在 QuickSight 编辑界面里就能自己加：
+
+1. **添加可视对象 → 自定义可视内容**（Custom visual content），摆好位置和大小（比如放在右侧一列）。
+2. 网址填管理员提供的聊天地址，即部署输出的 `ChatUrl` 原样填写，例如 `https://<api-id>.execute-api.cn-north-1.amazonaws.com.cn/`，斜杠后面不要加任何内容。
+3. 在新加的可视对象里点 **使用 Identity Center 登录**。聊天窗口会提示“还没有绑定分析”，并列出你能编辑的分析，最近修改的排在前面（正在编辑的这个通常在第一个）。
+4. 点选这个分析。聊天窗口会补上分析 ID 和全部参数（这样才能拿到当前控件值），并保存分析。
+5. **刷新浏览器页面**，聊天窗口即可在这个分析里使用。之后照常发布仪表盘（控制台“发布”，或在聊天里点/说“发布到仪表盘”），仪表盘里的聊天会自动识别自己在仪表盘中。
+
+说明：需要该分析的编辑权限；如果管理员在 `quickSight.allowedAnalysisIds` 里限定了分析，新分析要在名单内。以后分析增删了参数，聊天窗口会出现 **更新绑定**，点一下再刷新即可。管理员也可以继续用命令行 `./qsca attach <分析ID> --apply`。
+
+### 自定义示例问题
+
+输入框下方的 **示例问题** 在分析有自己的一套之前显示部署级默认：内置的是一个适用于任何分析的问题；管理员也可以在 `config.json` 的 `examples` 里配置。分析的编辑者在聊天窗口里维护这一套；能看这个分析、以及由它发布的仪表盘的人都能看到（仪表盘里不显示名称含“修改”的分组）。
+
+- 自己问过的问题下方有 **☆ 加入示例**，点一下加入“常用问题”分组（第一次加入时，会保留当时显示的默认示例）。
+- **示例问题** 旁的 **管理** 打开编辑器：每个分组有名称、可选说明、每行一个问题；可以添加/删除分组、**保存**，或 **恢复默认**（删除分析自己的那一套；删光所有分组再保存效果相同）。
+- 想先要一些建议，可以直接问助手，例如“给这个分析出一些示例问题”，它会按真实的图表、字段和参数列出问题；把需要的粘贴到 **管理** 里保存即可。
+
+限制：最多 8 个分组、每组 20 个问题、每个问题 200 字。保存后立即生效，无需重新部署。
+
+### 提问与修改
+
+1. 打开接入了助手的分析或仪表盘，点 **使用 Identity Center 登录**（已登录 QuickSight 时通常无需密码），有效期 8 小时。输入框下方折叠的 **示例问题** 栏按分组列出了示例，展开后点击即可提问。
 2. 提问示例：
    - 这个分析有哪些图表，各自展示什么？
    - 按当前筛选，最近一个月的平均价格走势如何？画个图。

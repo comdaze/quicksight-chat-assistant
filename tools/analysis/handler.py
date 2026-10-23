@@ -350,11 +350,91 @@ def bind_chat(args):
             "message": "已绑定。请刷新页面（编辑界面刷新后聊天窗口才会用上新地址）。"}
 
 
+EXAMPLES_LIMITS = {"groups": 8, "questions": 20, "question": 200, "group": 30, "tip": 80}
+
+
+def _examples_key(aid):
+    return {"jobId": f"examples#{aid}"}
+
+
+def _clean_examples(groups):
+    """Validate user-edited example groups: [{"group", "tip"?, "questions": [...]}] within EXAMPLES_LIMITS."""
+    if not isinstance(groups, list) or len(groups) > EXAMPLES_LIMITS["groups"]:
+        raise ToolError(f"最多 {EXAMPLES_LIMITS['groups']} 个分组")
+    out = []
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ToolError("分组格式不对")
+        name = " ".join(str(group.get("group") or "").split())[:EXAMPLES_LIMITS["group"]]
+        questions = []
+        for q in group.get("questions") or []:
+            q = " ".join(str(q).split())[:EXAMPLES_LIMITS["question"]]
+            if q and q not in questions:
+                questions.append(q)
+        if not name or not questions:
+            continue  # empty groups are dropped
+        if len(questions) > EXAMPLES_LIMITS["questions"]:
+            raise ToolError(f"“{name}”超过 {EXAMPLES_LIMITS['questions']} 个问题")
+        item = {"group": name, "questions": questions}
+        tip = " ".join(str(group.get("tip") or "").split())[:EXAMPLES_LIMITS["tip"]]
+        if tip:
+            item["tip"] = tip
+        if group.get("edit") or "修改" in name:
+            item["edit"] = True  # hidden in dashboards
+        out.append(item)
+    return out
+
+
+def get_examples(args):
+    """Example questions for the chat page: the analysis' own set (shared with its dashboards) or none (the page
+    then shows the deployment default). can_edit tells the page whether to offer 管理 / 加入示例."""
+    email, aid = caller.require_viewer(args)
+    item = jobs.get_item(Key=_examples_key(aid)).get("Item") or {}
+    can_edit = caller._has(caller.analysis_permissions(aid), caller.principals(email), "quicksight:UpdateAnalysis")
+    groups = json.loads(item["groups"]) if item.get("groups") else None
+    return {"groups": groups, "can_edit": can_edit, "updated_by": item.get("updatedBy"),
+            "updated_at": int(item["updatedAt"]) if item.get("updatedAt") else None}
+
+
+def save_examples(args):
+    """Editors of the analysis replace its example questions ("groups"), add one question ("add": {"question",
+    "group"?}), or go back to the deployment default ("reset": true)."""
+    email, aid = caller.require_editor(args)
+    key = _examples_key(aid)
+    if args.get("reset"):
+        jobs.delete_item(Key=key)
+        log(event="examples_reset", by=email, analysis=aid)
+        return {"groups": None}
+    if isinstance(args.get("add"), dict):
+        current = jobs.get_item(Key=key).get("Item") or {}
+        groups = json.loads(current["groups"]) if current.get("groups") else \
+            (args.get("base") if isinstance(args.get("base"), list) else [])
+        name = " ".join(str(args["add"].get("group") or "常用问题").split())[:EXAMPLES_LIMITS["group"]]
+        target = next((g for g in groups if g.get("group") == name), None)
+        if target is None:
+            target = {"group": name, "questions": []}
+            groups.insert(0, target)
+        target["questions"] = [str(args["add"].get("question") or "")] + \
+            [q for q in target.get("questions", []) if q != args["add"].get("question")]
+    else:
+        groups = args.get("groups")
+    groups = _clean_examples(groups)
+    if not groups:
+        raise ToolError("没有可保存的问题；要恢复默认示例请用“恢复默认”")
+    text = json.dumps(groups, ensure_ascii=False)
+    if len(text.encode()) > 20000:
+        raise ToolError("示例问题太多，请删减后再保存")
+    jobs.put_item(Item={**key, "groups": text, "updatedBy": email, "updatedAt": int(time.time())})
+    log(event="examples_saved", by=email, analysis=aid, groups=len(groups), questions=sum(len(g["questions"]) for g in groups))
+    return {"groups": groups}
+
+
 TOOLS = {"describe_analysis": describe_analysis, "preview_analysis_change": preview_analysis_change,
          "apply_pending_change": apply_pending_change, "undo_last_visual_change": undo_last_visual_change,
          "publish_dashboards": publish_dashboards, "bindable_analyses": bindable_analyses,
-         "chat_binding": chat_binding, "bind_chat": bind_chat}
-BUTTON_ONLY = ("apply_pending_change", "publish_dashboards", "bindable_analyses", "chat_binding", "bind_chat")
+         "chat_binding": chat_binding, "bind_chat": bind_chat, "get_examples": get_examples, "save_examples": save_examples}
+BUTTON_ONLY = ("apply_pending_change", "publish_dashboards", "bindable_analyses", "chat_binding", "bind_chat",
+               "get_examples", "save_examples")
 
 
 def handler(event, context):

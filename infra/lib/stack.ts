@@ -125,8 +125,8 @@ export class ChatAssistantStack extends Stack {
       actions: ['s3:PutObjectTagging', 's3:GetObjectTagging'], resources: [backups.arnForObjects('analysis-backups/*')],
     }));
     analysisFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem'], resources: [jobs.tableArn],
-      conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*'] } },
+      actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'], resources: [jobs.tableArn],
+      conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*', 'examples#*'] } },
     }));
 
     let vpcProps: Partial<lambda.FunctionProps> = {};

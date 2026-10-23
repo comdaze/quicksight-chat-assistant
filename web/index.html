@@ -7,6 +7,7 @@
 <style>
   :root{--ink:#16232b;--muted:#66747b;--line:#d9dfe2;--bg:#f6f8f9;--card:#fff;--brand:#0f7b72;--brand-soft:#e3f2ef;--err:#b3261e}
   *{box-sizing:border-box}
+  [hidden]{display:none !important}  /* class rules such as .hints{display:flex} must not override the hidden attribute */
   html,body{margin:0;height:100%;font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--bg)}
   .app{display:grid;grid-template-rows:auto auto 1fr auto auto;height:100%}
   header{padding:10px 14px;border-bottom:1px solid var(--line);background:var(--card);display:flex;align-items:center;gap:10px}
@@ -52,11 +53,24 @@
   .quick-toggle .arrow{display:inline-block;transition:transform .15s}
   .quick-toggle[aria-expanded=true] .arrow{transform:rotate(180deg)}
   .quick-panel{max-height:40vh;overflow:auto;margin-top:6px}
+  .quick-panel.editing{max-height:60vh}
   .quick-tabs{display:flex;flex-wrap:wrap;gap:2px 14px;border-bottom:1px solid var(--line)}
   .quick-tabs button{font:inherit;font-size:12px;border:0;border-bottom:2px solid transparent;background:none;padding:2px 0 4px;margin-bottom:-1px;cursor:pointer;color:var(--muted)}
   .quick-tabs button[aria-selected=true]{color:#0b5c55;border-bottom-color:var(--brand);font-weight:600}
   .quick .note{margin:6px 0 0}
   .quick .hints button:disabled{opacity:.5;cursor:default}
+  .quick-bar{display:flex;align-items:center;gap:10px}
+  .quick-manage{font:inherit;font-size:11px;border:0;background:none;color:var(--muted);cursor:pointer;padding:0;text-decoration:underline}
+  .ex-editor .ex-group{border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin:6px 0;background:var(--bg)}
+  .ex-editor input,.ex-editor textarea{font:inherit;font-size:12px;width:100%;border:1px solid var(--line);border-radius:6px;padding:4px 6px;margin:2px 0;background:#fff}
+  .ex-editor textarea{height:84px;resize:vertical}
+  .ex-editor .row{display:flex;gap:6px;align-items:center}
+  .ex-editor button{font:inherit;font-size:12px;border:1px solid var(--line);background:#fff;border-radius:6px;padding:2px 10px;cursor:pointer;margin:4px 6px 0 0}
+  .ex-editor button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .ex-editor .row button{margin:0;white-space:nowrap}
+  .add-example{display:none;font:inherit;font-size:11px;border:0;background:none;color:var(--muted);cursor:pointer;padding:0;align-self:flex-end;margin-top:-6px}
+  body.can-edit-examples .add-example{display:inline}
+  .add-example:hover{color:var(--brand)}
   .login{align-self:stretch;max-width:none;text-align:center;padding:18px}
   .login button{font:inherit;border:0;border-radius:8px;background:var(--brand);color:#fff;padding:8px 18px;cursor:pointer;margin-top:6px}
   .note{font-size:11px;color:var(--muted);margin:4px 0 0}
@@ -98,11 +112,13 @@
     <button class="send" id="send" type="submit">发送</button>
   </form>
   <section class="quick" id="quick" hidden>
-    <button type="button" class="quick-toggle" id="quickToggle" aria-expanded="false" aria-controls="quickPanel">示例问题 <span class="arrow" aria-hidden="true">▾</span></button>
+    <div class="quick-bar"><button type="button" class="quick-toggle" id="quickToggle" aria-expanded="false" aria-controls="quickPanel">示例问题 <span class="arrow" aria-hidden="true">▾</span></button>
+      <button type="button" class="quick-manage" id="quickManage" hidden title="增删、分组、调整这个分析的示例问题">管理</button></div>
     <div class="quick-panel" id="quickPanel" hidden>
       <div class="quick-tabs" id="quickTabs" role="tablist" aria-label="示例问题分组"></div>
       <p class="note" id="quickTip"></p>
       <div class="hints" id="quickList" role="tabpanel"></div>
+      <div class="ex-editor" id="quickEditor" hidden></div>
     </div>
   </section>
 </div>
@@ -249,45 +265,115 @@ function signOut(message) {
   showLogin(message);
 }
 // Example questions, one group per capability. A deployment can replace them (config.json "examples").
+// Built-in default: one question that works for any analysis. Each analysis gets its own set from its editors
+// (管理 / ☆ 加入示例); a deployment can replace this default with config.json "examples".
 const DEFAULT_EXAMPLES = [
-  { group: "了解分析", questions: [
-    "这个分析有哪些图表，各自展示什么？",
-    "这个分析用了哪些数据集和字段？",
-    "当前控件选了哪些值？它们会影响哪些图表？",
-  ] },
-  { group: "数据问答与出图", questions: [
-    "按当前筛选，主要指标最近的走势如何？画个图",
-    "按月汇总主要指标，并画出趋势图",
-    "按主要分类字段统计主要指标，前 5 名画柱状图对比",
-  ] },
-  { group: "计算分析（代码沙箱）", tip: "pandas 在无网络沙箱中计算", questions: [
-    "按月汇总主要指标，计算每月环比变化百分比，并画出环比图",
-    "按主要分类字段汇总主要指标，计算各自占总量的比例并排名",
-    "按日汇总主要指标，计算 7 日移动平均，和原始值画在同一张图上",
-    "按日汇总主要指标，找出偏离均值 2 倍标准差以上的异常日期",
-  ] },
-  { group: "控件联动", tip: "列出要在上方控件里选的值", questions: [
-    "在仪表盘上只看主要指标最大的那个分类",
-    "帮我把日期范围切到数据里的最后一个月",
-  ] },
-  { group: "修改分析", edit: true, tip: "需要编辑权限，在分析编辑界面里使用；先预览，点“应用到分析”才生效", questions: [
-    "把第一个折线图改成柱状图，先给我看预览",
-    "把第一个折线图改成按月显示",
-    "给第一个图表换一个更清楚的标题",
-    "新增一个表格：按主要分类字段统计主要指标的平均值，按数值降序",
-    "新增一个柱状图：按主要分类字段统计主要指标的总和",
-    "撤销",
-  ] },
+  { group: "快速开始", tip: "分析的编辑者可以点“管理”为这个分析设置示例问题", questions: ["这个分析有哪些图表，各自展示什么？"] },
 ];
 const ALL_EXAMPLES = (() => { try { const v = __EXAMPLES__; return Array.isArray(v) && v.length ? v : DEFAULT_EXAMPLES; } catch { return DEFAULT_EXAMPLES; } })();
 // Edit examples ("edit": true, or a group named 修改分析) make no sense in a published dashboard.
-const EXAMPLES = IN_DASHBOARD ? ALL_EXAMPLES.filter((g) => !(g.edit || /修改/.test(g.group || ""))) : ALL_EXAMPLES;
+const forPage = (groups) => (IN_DASHBOARD ? groups.filter((g) => !(g.edit || /修改/.test(g.group || ""))) : groups);
+let EXAMPLES = forPage(ALL_EXAMPLES);
+// The analysis' own examples (shared with its dashboards), edited here by its editors; none: the default above.
+const examples = { custom: false, canEdit: false };
+async function loadExamples() {
+  if (!ANALYSIS || !auth) return;
+  try {
+    const result = await api(`/examples?analysis=${encodeURIComponent(ANALYSIS)}`);
+    applyExamples(result.groups);
+    examples.canEdit = !!result.can_edit && !IN_DASHBOARD;
+    $("quickManage").hidden = !examples.canEdit;
+    document.body.classList.toggle("can-edit-examples", examples.canEdit);
+  } catch {}  // keep the default examples
+}
+function applyExamples(groups) {
+  examples.custom = Array.isArray(groups) && groups.length > 0;
+  EXAMPLES = forPage(examples.custom ? groups : ALL_EXAMPLES);
+  quickGroup = Math.min(quickGroup, Math.max(EXAMPLES.length - 1, 0));
+  if (!$("quickPanel").hidden && $("quickEditor").hidden) renderQuick();  // never redraw over an open editor
+}
+async function addExample(question, button) {
+  button.disabled = true;
+  try {
+    // The first added question keeps the examples shown now (the default) next to it.
+    const result = await api("/examples", { method: "POST", body: JSON.stringify(
+      { analysis: ANALYSIS, add: { question }, base: examples.custom ? undefined : ALL_EXAMPLES }) });
+    applyExamples(result.groups);
+    button.textContent = "✓ 已加入示例（常用问题）";
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = `没有加入：${error.message}`;
+  }
+}
+function addUser(text) {
+  const div = add("user", render(text));
+  const star = document.createElement("button");
+  star.type = "button"; star.className = "add-example"; star.textContent = "☆ 加入示例";
+  star.title = "把这个问题加入这个分析的示例问题";
+  star.onclick = () => addExample(text, star);
+  div.after(star);
+  return div;
+}
+// 管理: one box per group (name, optional tip, one question per line); answers the assistant generated can be pasted.
+function renderEditor() {
+  const editor = $("quickEditor");
+  const groups = (examples.custom ? EXAMPLES : ALL_EXAMPLES).map((g) => ({ ...g }));
+  editor.innerHTML = `<p class="note">每行一个问题；删光所有分组再保存，等于恢复默认。可以先让助手“给这个分析出一些示例问题”，再把喜欢的粘贴进来。分析和由它发布的仪表盘共用这一套；仪表盘里不显示名称含“修改”的分组。</p>
+    <div class="ex-groups"></div>
+    <button type="button" class="ex-add">添加分组</button><br>
+    <button type="button" class="primary ex-save">保存</button><button type="button" class="ex-cancel">取消</button><button type="button" class="ex-reset">恢复默认</button>
+    <p class="note ex-msg"></p>`;
+  const list = editor.querySelector(".ex-groups");
+  const addGroup = (g) => {
+    const box = document.createElement("div");
+    box.className = "ex-group";
+    box.innerHTML = `<div class="row"><input class="ex-name" maxlength="30" placeholder="分组名，例如：常用问题"><button type="button" class="ex-del">删除分组</button></div>
+      <input class="ex-tip" maxlength="80" placeholder="说明（可选）"><textarea class="ex-questions" placeholder="每行一个问题"></textarea>`;
+    box.querySelector(".ex-name").value = g.group || "";
+    box.querySelector(".ex-tip").value = g.tip || "";
+    box.querySelector(".ex-questions").value = (g.questions || []).join("\n");
+    box.querySelector(".ex-del").onclick = () => box.remove();
+    list.append(box);
+  };
+  groups.forEach(addGroup);
+  const msg = editor.querySelector(".ex-msg");
+  const close = () => { showEditor(false); renderQuick(); };
+  const save = async (body) => {
+    msg.textContent = "正在保存…"; msg.classList.remove("err"); msg.scrollIntoView({ block: "nearest" });
+    try {
+      const result = await api("/examples", { method: "POST", body: JSON.stringify({ analysis: ANALYSIS, ...body }) });
+      applyExamples(result.groups); close();
+    } catch (error) { msg.textContent = `没有保存：${error.message}`; msg.classList.add("err"); msg.scrollIntoView({ block: "nearest" }); }
+  };
+  editor.querySelector(".ex-add").onclick = () => addGroup({});
+  editor.querySelector(".ex-cancel").onclick = close;
+  editor.querySelector(".ex-reset").onclick = () => save({ reset: true });
+  editor.querySelector(".ex-save").onclick = () => {
+    const groups = [...list.querySelectorAll(".ex-group")].map((box) => ({
+      group: box.querySelector(".ex-name").value.trim(), tip: box.querySelector(".ex-tip").value.trim(),
+      questions: box.querySelector(".ex-questions").value.split("\n").map((q) => q.trim()).filter(Boolean),
+    })).filter((g) => g.questions.length);
+    if (groups.some((g) => !g.group)) { msg.textContent = "有问题的分组需要填写分组名。"; msg.classList.add("err"); msg.scrollIntoView({ block: "nearest" }); return; }
+    // Every group deleted (or emptied): the analysis goes back to the default examples.
+    save(groups.length ? { groups } : { reset: true });
+  };
+  showEditor(true);
+}
 // Collapsed "示例问题" bar under the input box: one tab per group; clicking a question asks it and folds the panel.
 let quickGroup = 0;
 function setQuickOpen(open) {
   $("quickToggle").setAttribute("aria-expanded", String(open));
   $("quickPanel").hidden = !open;
+  showEditor(false);
   if (open) renderQuick();
+}
+function showEditor(on) {  // the panel shows either the example questions or the 管理 editor, never both
+  $("quickEditor").hidden = !on;
+  $("quickTabs").hidden = on;
+  $("quickList").hidden = on;
+  if (on) $("quickTip").hidden = true;
+  $("quickPanel").classList.toggle("editing", on);
+  $("quickManage").textContent = on ? "完成管理" : "管理";
 }
 function renderQuick() {
   const tabs = $("quickTabs"), list = $("quickList");
@@ -310,6 +396,11 @@ function renderQuick() {
   }
 }
 $("quickToggle").addEventListener("click", () => setQuickOpen($("quickPanel").hidden));
+$("quickManage").addEventListener("click", () => {
+  if (!$("quickEditor").hidden) { showEditor(false); renderQuick(); return; }  // 完成管理: back to the questions
+  if ($("quickPanel").hidden) { $("quickPanel").hidden = false; $("quickToggle").setAttribute("aria-expanded", "true"); }
+  renderEditor();
+});
 $("quickPanel").addEventListener("keydown", (e) => { if (e.key === "Escape") { setQuickOpen(false); $("quickToggle").focus(); } });
 function showGreeting() {
   const hello = `你好${auth.user.name ? "，" + escapeHtml(auth.user.name) : ""}。`;
@@ -538,7 +629,7 @@ async function ask(prompt, resumeJob) {
   if (!auth) { showLogin(); return; }
   if (!ANALYSIS) { showBindChooser(); return; }
   $("send").disabled = true;
-  add("user", render(prompt));
+  addUser(prompt);
   const pending = add("bot", `<span class="typing">${resumeJob ? "页面已刷新，继续获取回答…" : "正在查询数据…"}</span>`);
   const started = resumeJob ? resumeJob.at : Date.now();
   try {
@@ -594,7 +685,7 @@ function replayHistory() {
   history.push(...turns);
   add("bot", `<p class="typing">已恢复本浏览器 8 小时内的 ${Math.ceil(turns.length / 2)} 轮对话。</p>`);
   for (const turn of turns) {
-    if (turn.role === "user") add("user", render(turn.content));
+    if (turn.role === "user") addUser(turn.content);
     else { const box = add("bot", answerHtml(turn)); mountCharts(box, turn.charts, turn); }
   }
 }
@@ -610,7 +701,7 @@ function resumePending() {  // a control change reloads this iframe; pick up the
 // ---- Binding: a chat visual added with the bare chat URL (no analysis=) binds itself to its analysis on request ----
 function startSession(restore) {
   if (!ANALYSIS) { showBindChooser(); return; }
-  setInputEnabled(true); showGreeting();
+  setInputEnabled(true); showGreeting(); loadExamples();
   if (restore) { replayHistory(); resumePending(); }
   if (!IN_DASHBOARD) checkBinding();
 }
